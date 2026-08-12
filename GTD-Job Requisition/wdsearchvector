@@ -1,0 +1,71 @@
+import typing
+import json
+import requests
+import core
+
+def wdsearchvector(payload: typing.Annotated[str, "payload for the usecase"] = None, 
+    conversation_id: typing.Annotated[str, "name of the usecase"] = None):
+
+    # Get credentials
+    CREDENTIALS_KEY = "wd-tool-secrets"
+    credentials = core.get_secret(CREDENTIALS_KEY)
+
+    quasarbaseurl = credentials.get("quasar_baseurl")
+    quasarusername = credentials.get("quasar_username")
+    quasarpassword = credentials.get("quasar_password")
+
+    print(f"Quasar: username={quasarusername}, password={quasarpassword}, url={quasarbaseurl}")
+
+    # Quasar Token Generation
+    def QToken(quasarurl, quasarusername, quasarpassword):
+        url = f"{quasarurl}/atr-gateway/identity-management/api/v1/auth/short-token?useDeflate=true"
+        payload = {"username": quasarusername, "password": quasarpassword}
+        headers = {"Content-Type": "application/json"}
+        try:
+            response = requests.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            return response.json().get("token")
+        except requests.exceptions.HTTPError as http_err:
+            print(f"HTTP error occurred: {http_err}")
+        except json.JSONDecodeError as json_err:
+            print(f"JSON decode error: {json_err}")
+            print(f"Response text: {response.text}")
+        except Exception as err:
+            print(f"An error occurred: {err}")
+        return None
+
+    if not payload:
+        return {"error": "Missing required field"}
+
+    token = QToken(quasarbaseurl, quasarusername, quasarpassword)
+
+    if token is not None:
+        headers = {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "apiToken": token
+        }
+        
+        url = f"{quasarbaseurl}/api/v2/acnopenai/searchvectors"
+        payload = json.loads(payload)
+        
+        
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=60)
+            if response.status_code == 200:
+                try:
+                    filename = f"{conversation_id}.txt"
+                    core.write_artifact(f"artifacts/{filename}", content=response.text)                                     
+                    return response.text
+                    
+                except json.JSONDecodeError:
+                    return {"error": "Response not in JSON format", "raw": response.text}
+            else:
+                return {
+                    "error": f"Quasar API call failed with status {response.status_code}",
+                    "details": response.text
+                }
+        except Exception as e:
+            return {"error": str(e)}
+    else:
+        return {"error": "Failed to generate Quasar token"}

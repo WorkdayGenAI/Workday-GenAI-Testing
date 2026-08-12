@@ -1,0 +1,892 @@
+import typing
+import uuid
+import re
+import core
+import requests
+import io
+
+def wd_test_scenerio_generation_to_csv(filename: typing.Annotated[str, "input file name"] = None, 
+    conversationid: typing.Annotated[str, "Conversation ID of the agent"] = None):
+
+    import pandas as pd
+
+    # =====================================================
+    # Artifact helper: try common locations
+    # =====================================================
+    # 835-token limit
+    def _get_artifact_bytes_anywhere(filename: str):
+        raw_bytes = core.get_artifact(
+                "uploaded_artifacts/" + filename,
+                text=False
+            )
+        return raw_bytes
+    
+    
+    def _safe_id(value: str) -> str:
+        value = str(value).strip()
+        return re.sub(r"[^A-Za-z0-9_\-]", "_", value) if value else uuid.uuid4().hex
+
+
+    # =====================================================
+    # Prompt builder (CSV input)
+    # =====================================================
+    
+    def _build_prompt_from_csv(csv_text: str) -> str:
+        return (
+            #"## Goal: Generate Workday Test Cases in Markdown table format.\n"
+
+        "## Goal: Generate Workday Test Cases in Markdown table format.\n"
+
+        "## REMEBER\n"
+        "The input is a CSV format text converted from an Excel spreadsheet that represents Workday Business Process steps and their attributes in tabular form.\n"
+        "Each row corresponds to one business process step.\n"
+        "Column names and column order MAY vary between files.\n"
+        "You must infer meaning based on semantic similarity, not exact column names.\n"
+        "For example, columns representing step name, step type, conditions, security role,\n"
+        "group, trigger or action name, or due date will use same or related labels.\n"
+        
+        "## YOUR FIRST TASK — INFER THE BUSINESS PROCESS NAME\n"
+        "Before generating any test cases, read ALL the step data below completely.\n"
+        "From the step names, security group names, action or approval types,\n"
+        "trigger or task descriptions, and overall flow,\n"
+        "infer the most likely Workday Business Process name.\n"
+
+        "Output your inferred BP name on the VERY FIRST LINE of your response\n"
+        "in this exact format:\n"
+        "INFERRED_BP: <your inferred BP name here>\n"
+        "Use proper Workday BP naming convention e.g. \"Hire Employee\", \"Change Job\",\n"
+        "\"Terminate Employee\", \"Create Position\", \"Request Compensation Change\",\n"
+        "\"Promote Employee\".\n"
+    
+        "## CRITICAL OUTPUT RULES\n"
+        "After the INFERRED_BP line, output a Markdown table and NOTHING ELSE.\n"
+        "Do NOT write any text, explanation, or commentary before or after the table.\n"
+        "Do NOT wrap the table in code fences (no ```).\n"
+        "The line immediately after INFERRED_BP: <name> must start with: |\n"
+        "The VERY LAST character must be: |\n"
+        "Every row must have exactly 7 pipe-delimited columns.\n"
+        "Do NOT leave any cell blank.\n"
+        "NEVER use Workday internal step order identifiers anywhere in the output table.\n"
+        "This means NEVER write \"step a\", \"step b\", \"step c\", \"step d\", \"step i\", \"step j\",\n"
+        "\"step k\", \"step l\" or any similar order code in ANY column of ANY row.\n"
+        
+        "## PLAIN ENGLISH LANGUAGE RULE — APPLIES TO EVERY COLUMN\n"
+        "This rule overrides everything else and applies to ALL columns without exception.\n"
+        
+        "ALL output must be written in clear, user-friendly business language.\n"
+        "NEVER copy raw Workday system syntax, condition expressions, or technical strings\n"
+        "into any cell.\n"
+        
+        "This includes but is not limited to:\n"
+        "  - Any condition expressions copied verbatim from conditional columns\n"
+        "  - Any internal Workday field names, system identifiers, or coded expressions\n"
+        "  - Any text that uses system operators like '=', '!=', '?'\n"
+        
+        "Always translate technical conditions and system language into plain,\n"
+        "human-readable business English.\n"
+        
+        "How to translate conditions:\n"
+        "  - Read the condition-related column (even if the column name varies)\n"
+        "    to understand its business meaning\n"
+        "  - Ask: what real-world business situation does this condition describe?\n"
+        "  - Write that business situation in plain English as the reason\n"
+        "  - For always-FALSE conditions (e.g., 1=0?): write\n"
+        "    'not applicable for this scenario'\n"
+        "  - For conditions that are FALSE: write what is true in this scenario\n"
+        "    that causes the step to be skipped\n"
+        "  - For conditions that are TRUE: describe what the step accomplishes\n"
+        
+        "Examples of correct translation approach (illustrative only — derive your\n"
+        "actual reasons from YOUR input data):\n"
+        "  WRONG: SKIPPED (Condition: 1=0? = always FALSE)\n"
+        "  RIGHT: SKIPPED — not applicable for this scenario\n"
+        
+        "  WRONG: SKIPPED (Condition: [raw system text] = FALSE)\n"
+        "  RIGHT: SKIPPED — [plain English explanation of why this step does not apply]\n"
+        
+        "  WRONG: condition not met\n"
+        "  RIGHT: [specific business reason the step is skipped]\n"
+        
+        "## CONCISENESS RULES — STRICTLY ENFORCED\n"
+        
+        "These rules override everything else for cell content:\n"
+        
+        "Column 2 (Test Scenario):\n"
+        "  - MAX 25 words\n"
+        "  - Name ONLY the condition(s) being tested in THIS row and TRUE/FALSE state\n"
+        "  - Written in plain business English — no technical Workday syntax\n"
+        "  - Format:\n"
+        "    \"[Initiator] initiates [BP] — [condition focus in plain English] — [one-word outcome]\"\n"
+        
+        "Column 5 (Test Case Description):\n"
+        "  - MAX 3 sentences\n"
+        "  - Sentence 1: who initiates and what primary condition is being tested\n"
+        "    (plain business language)\n"
+        "  - Sentence 2: which conditional steps execute or skip as a direct result\n"
+        "    (plain English)\n"
+        "  - Sentence 3: how the process completes\n"
+        "  - NEVER include raw condition syntax or system field names\n"
+        
+        "## ══════════════════════════════════════════════════════════\n"
+        "## COLUMN 6 (Test Steps) — MANDATORY FULL STEP TRACE RULES\n"
+        "## ══════════════════════════════════════════════════════════\n"
+        
+        "Column 6 MUST list EVERY step from the process in ORDER from Initiation\n"
+        "to final verification.\n"
+        "Do NOT summarise, skip, or group steps.\n"
+        
+        "### HOW TO BUILD COLUMN 6 FOR EACH TEST CASE:\n"
+        
+        "STEP 1 — Extract the master step list:\n"
+        "  Read ALL rows from the CSV input in their logical order.\n"
+        "  Do NOT rely on fixed column names or positions; infer meaning by similarity.\n"
+        
+        "  For each row, determine the DISPLAY NAME using this priority logic:\n"
+        
+        "    - If the step type represents a To Do AND a task description or To Do label\n"
+        "      is present:\n"
+        "        DISPLAY NAME = the To Do task description\n"
+        
+        "    - If the step type represents an Action, Approval, or Service:\n"
+        "        DISPLAY NAME = the trigger, action, or approval name\n"
+        
+        "    - For the Initiation step:\n"
+        "        DISPLAY NAME = \"Initiate [BP Name]\"\n"
+        
+        "  Also determine for each row (by inference, not exact column name):\n"
+        "    - Step Type\n"
+        "    - Primary Security Group or Role\n"
+        "    - Condition (for evaluation only — NEVER output raw text)\n"
+        
+        "STEP 2 — Apply this scenario's conditions:\n"
+        "  For each step that has a condition:\n"
+        "    - If the condition evaluates TRUE in this scenario → include as EXECUTE\n"
+        "    - If the condition evaluates FALSE → include as SKIP\n"
+        "    - Always-false conditions → always SKIP\n"
+        "  Steps with NO condition → always EXECUTE\n"
+
+        "### STEP ORDERING AND COMPLETION STEP RULES:\n"
+        
+        "The step sequencing column from the CSV input is the ONLY valid order for listing steps.\n"
+        "This may be labelled as Order, Sequence, Step Order, or similar.\n"
+        "List ALL steps strictly in that inferred sequence regardless of step type.\n"
+        "Do NOT reorder steps based on logic, assumptions, or process knowledge.\n"
+        
+        "COMPLETION STEP behaviour:\n"
+        "  - The step identified as the completion step (via a column indicating completion\n"
+        "    or an equivalent marker) is where the process officially completes.\n"
+        "  - It must be labelled — COMPLETION STEP in its entry.\n"
+        "  - ALL steps that appear AFTER the completion step in the inferred step sequence\n"
+        "    are post-completion or parallel background steps.\n"
+        "  - These steps still appear in Column 6 in their exact sequence position.\n"
+        "  - Label every post-completion step clearly:\n"
+        "    [N]. [DISPLAY NAME] ([Step Type]) — [Group] must [action] — POST-COMPLETION STEP\n"
+        "  - Post-completion steps are optional or administrative tasks that occur\n"
+        "    after the main process has completed.\n"
+        "  - The final verification step always remains the very last item:\n"
+        "    [N]. Verify process status changes to Complete\n"
+        
+        "STEP 3 — Write numbered steps in sequence:\n"
+        "  Number every step 1, 2, 3, 4... in the exact inferred step sequence.\n"
+        "  ALL step descriptions must be written in plain, user-friendly business English.\n"
+        "  NEVER include raw system condition expressions in any step description.\n"
+        
+        "  CRITICAL — EVERY EXECUTE STEP MUST STATE:\n"
+        "    (a) WHO performs the step (the assigned security group or role)\n"
+        "    (b) WHAT they must do (a plain English action verb phrase describing the task)\n"
+        "  Do NOT simply say 'assigned to [Group]' — always describe the action.\n"
+        
+        "  Use this format for each step by type:\n"
+        
+        "  INITIATION step:\n"
+        "    1. Initiate [BP Name] — [Security Group] must initiate the [BP Name] process\n"
+        
+        "  ACTION step (standard):\n"
+        "    [N]. [Action Name] (Action) — [Security Group] must complete [Action Name] and submit\n"
+        
+        "  ACTION step (review type):\n"
+        "    [N]. [Action Name] (Action) — [Security Group] must review the details and submit\n"
+        
+        "  TO DO step:\n"
+        "    [N]. [To Do Name] (To Do) — [Security Group] must complete the [To Do Name] task and mark it done\n"
+        
+        "  SERVICE step:\n"
+        "    [N]. [Service Name] (Service) — system automatically executes [Service Name]\n"
+        
+        "  APPROVAL step:\n"
+        "    [N]. [Approval Name] (Approval) — [Security Group] must review all details and approve,\n"
+        "    or send back if corrections are needed\n"
+        
+        "  COMPLETION STEP (append label):\n"
+        "    [N]. [Step Name] ([Step Type]) — [Security Group] must [action] — COMPLETION STEP\n"
+        
+        "  POST-COMPLETION STEP (append label):\n"
+        "    [N]. [Step Name] ([Step Type]) — [Security Group] must [action] — POST-COMPLETION STEP\n"
+        
+        "  SKIPPED step (condition FALSE):\n"
+        "    [N]. [DISPLAY NAME] ([Step Type]) — SKIPPED — [plain English business reason]\n"
+        "    CRITICAL: The reason MUST be written in plain English.\n"
+        "    NEVER copy raw conditional text into the reason.\n"
+        "    NEVER use expressions containing '?', '=', or system field names.\n"
+        "    For always-FALSE steps: write 'not applicable for this scenario'\n"
+        "    For business condition FALSE steps: write the plain English business reason\n"
+        "    derived from understanding what that condition means in the context of this BP.\n"
+        
+        "STEP 4 — Final verification step:\n"
+        "  Always add as the very last numbered item after all other steps:\n"
+        "  [N]. Verify process status changes to Complete\n"
+        
+        "IMPORTANT: There is NO maximum step count limit for Column 6.\n"
+        "Every single step from the CSV input must appear in the output,\n"
+        "either as EXECUTE or SKIP.\n"
+        "This is non-negotiable — partial step lists are INCORRECT.\n"
+        
+        "## ══════════════════════════════════════════════════════════\n"
+        "## COLUMN 7 (Expected Result) — STEP-BY-STEP RESULTS\n"
+        "## ══════════════════════════════════════════════════════════\n"
+        
+        "Column 7 MUST have a corresponding expected result for EVERY step listed in Column 6.\n"
+        "Match each Column 6 step exactly, in the same order.\n"
+        "ALL expected results must be written in plain, user-friendly business English.\n"
+        "NEVER write 'condition not met' as an expected result.\n"
+        "NEVER include raw system condition syntax in any expected result.\n"
+        
+        "Format for each result by step type:\n"
+        
+        "  INITIATION step result:\n"
+        "    1. [BP Name] initiated successfully — [Security Group] has started the process\n"
+        
+        "  ACTION step result:\n"
+        "    [N]. [Action Name] completes successfully — [Security Group] submits the action\n"
+        
+        "  TO DO step result:\n"
+        "    [N]. [To Do Name] completes successfully — [Security Group] marks the task as done\n"
+        
+        "  SERVICE step result:\n"
+        "    [N]. [Service Name] completes — system executes [Service Name] automatically\n"
+        
+        "  APPROVAL step result:\n"
+        "    [N]. [Approval Name] approved — [Security Group] reviews and approves successfully\n"
+        
+        "  COMPLETION STEP result:\n"
+        "    [N]. [Step Name] completes — [Security Group] completes the step and process completion is triggered\n"
+        
+        "  POST-COMPLETION STEP result:\n"
+        "    [N]. [Step Name] completes — [Security Group] completes the post-process administrative task\n"
+        
+        "  SKIPPED step result:\n"
+        "    [N]. [Step Name] is skipped — [plain English reason matching Column 6's reason for this step]\n"
+        "    NEVER write 'condition not met' — always write the specific business reason.\n"
+        "    The reason must match exactly what was written in Column 6 for the same step.\n"
+        
+        "  Final verification result (always last):\n"
+        "    [N]. Process status confirmed as Complete — record is active in the system\n"
+        
+        "IMPORTANT: There is NO maximum result count limit for Column 7.\n"
+        "Every step in Column 6 must have a matching result in Column 7.\n"
+        
+
+        "## ROLE & OBJECTIVE\n"
+        "You are a Workday test case generator.\n"
+        "Your ONLY source of truth is the step data between\n"
+        "--- START OF STEP DATA --- and --- END OF STEP DATA ---\n"
+        "The step data is provided as CSV converted from an Excel file.\n"
+        "Do NOT invent any step, condition, group, or field name not present in the step data.\n"
+        "Do NOT assume this is any specific business process — derive everything purely from the step data.\n"
+        
+        "---\n"
+        
+        "## PHASE 1 — MANDATORY DATA EXTRACTION\n"
+        
+        "### P1-A: LIST ALL STEPS IN ORDER\n"
+        "For each row in the step data, process records in sequence based on the inferred step order column\n"
+        "(for example: Order, Sequence, Step Order, or similar).\n"
+        
+        "For each row, extract and record the following by semantic meaning, not exact column name:\n"
+        "  - Step Order / Sequence\n"
+        "  - Step Name or Descriptor (full human-readable step label)\n"
+        "  - Step Type (Action / To Do / Approval / Initiation / Service)\n"
+        "  - Action, Trigger, or Task Name\n"
+        "  - To Do Task Name — this is the human-readable task name\n"
+        "    This appears ONLY for To Do type steps.\n"
+        "    Use whatever values appear in YOUR step data — do not assume fixed labels.\n"
+        "  - Condition text (for internal evaluation only —\n"
+        "    NEVER output raw condition text into the table)\n"
+        "  - Primary Security Group or Role\n"
+        "  - Alternate Security Group or Routing Group (if present)\n"
+        "  - Completion Step indicator (value indicating this step triggers process completion)\n"
+        "  - Due Date Based on Effective Date indicator (if present)\n"
+        
+        "Note:\n"
+        "  - Multiple rows with the same step order indicate parallel steps at the same stage.\n"
+        "  - ALL such rows must be listed and later appear individually in Column 6.\n"
+        
+        "### P1-B: INITIATING SECURITY GROUPS\n"
+        "Extract ALL initiating security groups from the step data.\n"
+        "These may appear in columns labelled Initiator, Initiating Group,\n"
+        "Initiating Security Group, or similar.\n"
+        
+        "Record every initiating group descriptor individually as a numbered list.\n"
+        "This list is used ONLY to rotate initiators across scenario rows.\n"
+        "It does NOT control the number of scenario rows generated.\n"
+        "NEVER output this full list in any single table cell.\n"
+
+        "### P1-C: LIST EVERY CONDITION\n"
+        "For each non-empty condition field found in the step data:\n"
+        "  - Assign ID: C1, C2, C3...\n"
+        "  - Record the exact condition text verbatim for internal evaluation only\n"
+        "    (NEVER paste this into output columns)\n"
+        "  - Classify the condition as:\n"
+        "    ALWAYS-FALSE / ALWAYS-TRUE / BUSINESS-CONDITION\n"
+        "  - Write a plain English translation that will be used in output columns\n"
+        "  - For BUSINESS-CONDITION:\n"
+        "    note the TRUE-path behavior and FALSE-path (skipped) behavior\n"
+        "  - Count total BUSINESS-CONDITIONs and record this count as N\n"
+
+        "### P1-D: ALTERNATE GROUPS\n"
+        "List all non-empty alternate or routing security group values\n"
+        "along with their associated step.\n"
+        
+        "### P1-E: COMPLETION STEP\n"
+        "Identify the step marked as triggering process completion\n"
+        "based on the completion indicator column.\n"
+        "Record its exact step order position and step name.\n"
+        "All steps with order values AFTER this step are POST-COMPLETION steps.\n"
+        
+        "### P1-F: DUE DATE EFFECTIVE STEPS\n"
+        "Identify all steps where the due date is based on the effective date,\n"
+        "based on the relevant indicator column if present.\n"
+        
+        "### P1-G: SCENARIO DIMENSIONS — BUILD BEFORE PHASE 2\n"
+        "Before building the scenario matrix, identify ALL dimensions that drive scenario variation:\n"
+        "  Dimension A — BUSINESS-CONDITIONs:\n"
+        "    each condition Cn has a TRUE state and a FALSE state\n"
+        "  Dimension B — Routing:\n"
+        "    primary security group path vs each alternate group path from P1-D\n"
+        "  Dimension C — Completion:\n"
+        "    completion step path must be explicitly verified\n"
+        "  Dimension D — Approval outcomes:\n"
+        "    where Approval steps exist, both approve and send-back paths\n"
+        "  Dimension E — ALWAYS-FALSE conditions:\n"
+        "    group all into one dedicated validation scenario\n"
+        "  Dimension F — MAX-PATH:\n"
+        "    all BUSINESS-CONDITIONs TRUE simultaneously\n"
+        "  Dimension G — MIN-PATH:\n"
+        "    all BUSINESS-CONDITIONs FALSE simultaneously\n"
+        
+        "The total number of scenario rows is determined by the maximum meaningful combinations\n"
+        "across ALL of these dimensions — NOT by the number of initiating security groups.\n"
+        "Initiating security groups from P1-B are rotated across scenarios to distribute coverage\n"
+        "but do NOT add extra rows by themselves.\n"
+        
+        "---\n"
+        
+        "## PHASE 2 — SCENARIO MATRIX\n"
+        
+        "## SCENARIO ROW COUNT RULE — THIS IS THE PRIMARY RULE\n"
+        "The number of scenario rows is driven ENTIRELY by the maximum meaningful combination\n"
+        "of scenario dimensions identified in P1-G.\n"
+        
+        "Minimum rows = 2 x N (one TRUE + one FALSE per BUSINESS-CONDITION)\n"
+        "              + 1 (MAX-PATH row)\n"
+        "              + 1 (MIN-PATH row)\n"
+        "              + 1 (COMPLETION STEP verification row)\n"
+        "              + number of alternate groups from P1-D (one row each)\n"
+        "              + 1 (ALWAYS-FALSE validation row, only if ALWAYS-FALSE conditions exist)\n"
+        "              + additional rows for any further meaningful combinations not yet covered\n"
+        
+        "where N = number of BUSINESS-CONDITIONs from P1-C.\n"
+        "The number of initiating security groups has NO effect on row count.\n"
+        
+        "## INITIATOR ROTATION RULE\n"
+        "Initiating security groups from P1-B are assigned to scenario rows using rotation.\n"
+        "Rotate through the P1-B list sequentially — assign one initiator per row.\n"
+        "When the list is exhausted, start again from the beginning of the list.\n"
+        "This ensures initiator variety across the output without inflating row count.\n"
+        "Column 3 for EVERY row must contain EXACTLY ONE security group name — no lists.\n"
+        "The assigned initiator name must exactly match the descriptor value\n"
+        "found in the step data.\n"
+        
+        "### P2-A: ONE ROW PER BUSINESS-CONDITION STATE\n"
+        "For each BUSINESS-CONDITION Cn from P1-C:\n"
+        "  - ONE row where Cn=TRUE and all other conditions are at their minimum or default state\n"
+        "    Focus: this row tests specifically what happens when Cn is TRUE\n"
+        "  - ONE row where Cn=FALSE and all other conditions are at their minimum or default state\n"
+        "    Focus: this row tests specifically what happens when Cn is FALSE\n"
+        "  Assign initiator by rotation from the P1-B list.\n"
+        
+        "### P2-B: COMBINATION ROWS\n"
+        "  MAX-PATH row:\n"
+        "    all BUSINESS-CONDITIONs TRUE simultaneously\n"
+        "    Focus: every conditional step executes — maximum process coverage\n"
+        "    Assign initiator by rotation from the P1-B list.\n"
+        
+        "  MIN-PATH row:\n"
+        "    all BUSINESS-CONDITIONs FALSE simultaneously\n"
+        "    Focus: every conditional step is skipped — minimum process path\n"
+        "    Assign initiator by rotation from the P1-B list.\n"
+        
+
+        "### P2-C: ALTERNATE GROUP ROUTING ROWS\n"
+        "For each alternate routing or security group identified in P1-D:\n"
+        "  Generate ONE scenario row that routes through that alternate group path.\n"
+        "  Column 3 format for this row:\n"
+        "  '[Initiator from P1-B rotation] (Alternate: [Alternate Group Name])'\n"
+        
+        "### P2-D: COMPLETION STEP VERIFICATION ROW\n"
+        "Generate ONE scenario row explicitly designed to reach and verify the step\n"
+        "that triggers process completion.\n"
+        "This row must set all conditions such that the completion step is reached\n"
+        "and executed successfully.\n"
+        "Assign the initiator by rotation from the P1-B list.\n"
+        
+        "### P2-E: ALWAYS-FALSE VALIDATION ROW\n"
+        "If any ALWAYS-FALSE conditions exist (identified in P1-C):\n"
+        "  Generate ONE dedicated row that validates every ALWAYS-FALSE condition step\n"
+        "  is permanently skipped regardless of scenario inputs.\n"
+        "  Column 5 must explicitly name every ALWAYS-FALSE step in plain English\n"
+        "  and confirm that it never executes.\n"
+        "  Assign the initiator by rotation from the P1-B list.\n"
+        "If no ALWAYS-FALSE conditions exist, skip this row entirely.\n"
+        
+        "### P2-F: APPROVAL OUTCOME ROWS\n"
+        "If any Approval-type steps exist in the process:\n"
+        "  Generate ONE row where the approval is granted and the process continues forward.\n"
+        "  Generate ONE row where the approval is sent back and the process returns for correction.\n"
+        "  Assign initiators for these rows by rotation from the P1-B list.\n"
+        "If no Approval steps exist in the process, skip these rows entirely.\n"
+        
+        "### P2-G: ADDITIONAL MEANINGFUL COMBINATION ROWS\n"
+        "After all mandatory rows above are generated, identify any remaining meaningful\n"
+        "combinations of conditions, routing paths, or step behaviors not yet covered.\n"
+        "Generate ONE additional scenario row per unique meaningful combination found.\n"
+        "Each additional row must be demonstrably different from every previously generated row.\n"
+        "Assign initiators by continuing rotation from the P1-B list.\n"
+        
+        "### P2-H: UNIQUENESS CHECK\n"
+        "Before finalising the scenario matrix, verify the following strictly:\n"
+        "  - No two rows share the same combination of condition states AND routing path\n"
+        "  - Every row has a clearly distinct primary testing focus\n"
+        "  - Remove or merge any duplicate or redundant scenarios discovered\n"
+        
+        "---\n"
+        
+        "## PHASE 3 — TEST DATA FIELDS\n"
+        "Derive ALL test data field names exclusively from the step data.\n"
+        "Do NOT assume fields from any specific Workday Business Process.\n"
+        "Format: comma-separated field names written in plain English.\n"
+        "For condition-driving fields, append:\n"
+        "[drives: plain English description of what this field controls].\n"
+        "Do NOT provide sample values.\n"
+        "Use SHORT, clear, plain English field names only.\n"
+        "NEVER use raw system condition syntax in test data field descriptions.\n"
+        
+        "---\n"
+        
+        "## PHASE 4 — WRITE THE TABLE\n"
+        
+        "### Column 1: Test Case ID\n"
+        "Format:\n"
+        "[Acronym][4-digit zero-padded serial]\n"
+        "The acronym is derived from the initials of the INFERRED BP name.\n"
+        
+        "### Column 2: Test Scenario — MAX 25 WORDS\n"
+        "Format:\n"
+        "\"[Initiator] initiates [BP name] — [this row's condition focus in plain English] — [outcome].\"\n"
+        "Use plain business English only.\n"
+        "Do NOT include any raw system condition syntax.\n"
+        
+        "### Column 3: Security Role — ONE SINGLE GROUP PER ROW — NON-NEGOTIABLE\n"
+        "EVERY row without exception must contain EXACTLY ONE security group name.\n"
+        "This is the initiator assigned by rotation from P1-B.\n"
+        "The group name must exactly match the descriptor value found in the step data.\n"
+        
+        "FORBIDDEN in Column 3:\n"
+        "  - Multiple group lists separated by commas\n"
+        "  - The phrase 'All initiators' or similar collective labels\n"
+        "  - Any group name not present in the step data\n"
+        "  - Blank cells\n"
+        
+        "For alternate group routing rows ONLY:\n"
+        "  '[Single Initiator Name] (Alternate: [Alternate Group Name])'\n"
+        
+        "### Column 4: Test Data / Inputs\n"
+        "Short, plain English field names derived from the step data only.\n"
+        "Clearly note condition drivers using plain English.\n"
+        "NEVER include raw system condition expressions.\n"
+        
+        "### Column 5: Test Case Description — MAX 3 SENTENCES\n"
+        "Focus on what is UNIQUE about this scenario's conditional or routing path.\n"
+        "Use plain business English only.\n"
+        "Do NOT include raw condition syntax or system field names.\n"
+        
+        "### Column 6: Test Steps — FULL ORDERED STEP TRACE (NO LIMIT)\n"
+        "Follow ALL STEP TRACE RULES defined earlier exactly.\n"
+        "Steps are listed in strict inferred step order — no reordering.\n"
+        "Every EXECUTE step must clearly state WHO performs it and WHAT they must do.\n"
+        "Steps occurring after the completion step must be labelled POST-COMPLETION STEP.\n"
+        "SKIPPED steps must include a plain English reason — NEVER raw condition text.\n"
+        "The final item must always be:\n"
+        "[N]. Verify process status changes to Complete\n"
+        
+        "### Column 7: Expected Result — MATCHING RESULT PER STEP (NO LIMIT)\n"
+        "Follow ALL STEP-BY-STEP RESULT RULES defined earlier exactly.\n"
+        "Every step listed in Column 6 must have a corresponding expected result\n"
+        "in Column 7 in the same order.\n"
+        "Each expected result must state who acted and what was achieved\n"
+        "in plain, user-friendly business English.\n"
+        "NEVER write 'condition not met'.\n"
+        "Post-completion step results must be clearly labelled as such.\n"
+        
+        "---\n"
+        
+        "## FINAL SELF-CHECK\n"
+        "Before outputting the table, verify that EVERY row passes ALL of the following checks:\n"
+        
+        "  OUTPUT FORMAT:\n"
+        "  - INFERRED_BP appears as the very first line\n"
+        "  - The table starts immediately after the INFERRED_BP line\n"
+        "  - Every row has exactly 7 pipe-delimited columns\n"
+        "  - No cell is blank\n"
+        
+        "  ROW COUNT VERIFICATION:\n"
+        "  - Total rows = (2 x N) + 1 MAX-PATH + 1 MIN-PATH + 1 COMPLETION\n"
+        "                + number of alternate groups\n"
+        "                + ALWAYS-FALSE row (if applicable)\n"
+        "                + APPROVAL rows (if applicable)\n"
+        "                + any additional meaningful combination rows\n"
+        "  - Row count is NOT based on the number of initiating security groups\n"
+        "  - Every row represents a unique scenario combination derived from P1-G dimensions\n"
+        
+        "  INITIATOR ROTATION VERIFICATION:\n"
+        "  - Initiators extracted in P1-B are rotated sequentially across rows\n"
+        "  - Column 3 of EVERY row contains exactly ONE security group name\n"
+        "  - No row contains multiple groups or collective labels in Column 3\n"
+        "  - The group name in Column 3 exactly matches a group descriptor found in the step data\n"
+        
+        "  SCENARIO COVERAGE:\n"
+        "  - Every BUSINESS-CONDITION has at least one TRUE row and one FALSE row\n"
+        "  - A MIN-PATH row exists (all BUSINESS-CONDITIONs FALSE)\n"
+        "  - A MAX-PATH row exists (all BUSINESS-CONDITIONs TRUE)\n"
+        "  - A COMPLETION STEP verification row exists\n"
+        "  - An ALWAYS-FALSE validation row exists if ALWAYS-FALSE conditions were identified\n"
+        "  - APPROVAL outcome rows exist if Approval steps are present\n"
+        "  - Every row is meaningfully distinct from all other rows\n"
+        
+        "  COLUMN 2:\n"
+        "  - MAX 25 words per row\n"
+        "  - Plain English only — no raw condition syntax\n"
+        
+        "  COLUMN 3:\n"
+        "  - Exactly ONE security group name per row — no exceptions\n"
+        "  - Name matches exactly a descriptor from the step data\n"
+        "  - No commas separating multiple group names\n"
+        "  - No collective labels such as 'All initiators'\n"
+        
+        "  COLUMN 4:\n"
+        "  - Plain English field names only\n"
+        "  - No raw system or condition expressions\n"
+        
+        "  COLUMN 5:\n"
+        "  - MAX 3 sentences per row\n"
+        "  - Plain English only\n"
+        
+        "  COLUMN 6:\n"
+        "  - EVERY step from the step data appears in strict inferred step order\n"
+        "  - Every EXECUTE step states WHO performs it and WHAT they must do\n"
+        "  - No step simply says 'assigned to [Group]' without describing the action\n"
+        "  - Steps occurring after the completion step are labelled POST-COMPLETION STEP\n"
+        "  - SKIPPED steps include plain English business reasons\n"
+        "  - The final item is always:\n"
+        "    [N]. Verify process status changes to Complete\n"
+        
+        "  COLUMN 7:\n"
+        "  - Every step in Column 6 has exactly one matching result in Column 7\n"
+        "  - Every result states who acted and what was achieved\n"
+        "  - The phrase 'condition not met' is NEVER used\n"
+        "  - Post-completion step results are clearly labelled\n"
+        "  - The final result matches the final verification step\n"
+        
+        "  PLAIN ENGLISH VALIDATION:\n"
+        "  - NO column contains raw Workday or system syntax such as '1=0?'\n"
+        "    or any verbatim conditional text from the step data\n"
+        
+        
+        "## REQUIRED TABLE HEADER\n"
+        "Buisness Process Name| Test Case ID | Test Scenario | Security Role | Test Data / Inputs | Test Case Description | Test Steps | Expected Result |\n"
+        
+        "Must return all the headers"
+        "---\n"
+
+        "##Output Format\n"
+        "1- INFEREDBP and its value(the BP name)\n"
+        "2- Required TABLE HEADER\n"
+        "3- Markdown Table Generated"
+            
+        "## STEP DETAILS — YOUR ONLY SOURCE OF TRUTH\n"
+        
+        "--- START OF STEP DATA ---\n"
+        + csv_text +
+        "\n--- END OF STEP DATA ---\n"
+        )
+    
+    
+    # =====================================================
+    # Claude call (single pass, with continuation if max_tokens hit)
+    # =====================================================
+    
+    def _call_claude(credentials: dict, prompt: str, max_tokens: int) -> str:
+        """
+        Calls an Anthropic-compatible messages endpoint via requests.
+        Supports continuation if stop_reason == 'max_tokens'.
+        """
+        endpoint = credentials.get("Endpoint", "").rstrip("/")
+        api_key = credentials.get("api_key")
+        model = credentials.get("deployment_name")
+    
+        if not endpoint or not api_key or not model:
+            raise ValueError("Claude credentials missing Endpoint/api_key/deployment_name")
+    
+        url = endpoint + "/anthropic/v1/messages"
+        headers = {
+            "x-api-key": api_key,
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01"
+        }
+    
+        session = requests.Session()
+        messages = [{"role": "user", "content": prompt}]
+        full_text = ""
+    
+        while True:
+            payload = {
+                "model": model,
+                "max_tokens": max_tokens,
+                "temperature": 0.2,
+                "messages": messages
+            }
+    
+            resp = session.post(url, headers=headers, json=payload, timeout=(10, 300))
+            resp.raise_for_status()
+            data = resp.json()
+    
+            chunk = "".join(item.get("text", "") for item in data.get("content", [])).strip()
+            full_text += chunk
+    
+            if data.get("stop_reason") != "max_tokens":
+                break
+    
+            # continuation
+            messages.append({"role": "assistant", "content": chunk})
+            messages.append({
+                "role": "user",
+                "content": "Continue from exactly where you stopped. Do not repeat content."
+            })
+    
+        return full_text
+    
+    
+    # =====================================================
+    # Text cleanup
+    # =====================================================
+    
+    def _clean_text(text: str) -> str:
+        """
+        Fix common encoding artifacts and strip HTML-like tags that show up as entities.
+        """
+        if not text:
+            return text
+    
+        replacements = {
+            "â€\"": "—",
+            "â€™": "'",
+            "â€œ": "\"",
+            "â€\x9d": "\"",
+            "â€¦": "...",
+            "â€¢": "-",
+            "Â ": " ",
+            "&amp;amp;": "&amp;",
+            "&amp;lt;": "&lt;",
+            "&amp;gt;": "&gt;",
+            "&amp;nbsp;": " "
+        }
+        for bad, good in replacements.items():
+            text = text.replace(bad, good)
+    
+        # remove entity-encoded tags like &lt;div&gt;
+        text = re.sub(r"&lt;[^&gt;]+&gt;", " ", text)
+        text = re.sub(r"\s{2,}", " ", text)
+        return text.strip()
+    
+    
+    # =====================================================
+    # Markdown table -> DataFrame
+    # =====================================================
+    
+    def _markdown_to_df(markdown_output: str):
+        """
+        Parses a single markdown table into a DataFrame.
+        Requires at least header row + one data row.
+        """
+        if not markdown_output:
+            return None
+    
+        lines = [ln.strip() for ln in markdown_output.splitlines() if ln.strip()]
+        table_lines = [ln for ln in lines if ln.startswith("|") and ln.endswith("|")]
+    
+        if len(table_lines) < 2:
+            return None
+    
+        # Remove separator row like: | --- | --- |
+        sep_re = re.compile(r"^\|[\s:\-|]+\|$")
+        cleaned = [ln for ln in table_lines if not sep_re.match(ln)]
+    
+        if len(cleaned) < 2:
+            return None
+    
+        header = _parse_md_row(cleaned[0])
+        n_cols = len(header)
+        rows = []
+        rows.append(header)
+        for raw in cleaned[1:]:
+            parsed = _parse_md_row(raw)
+    
+            if len(parsed) == n_cols:
+                rows.append(parsed)
+            elif len(parsed) > n_cols:
+                # merge overflow into last column
+                merged = parsed[:n_cols - 1] + [" | ".join(parsed[n_cols - 1:])]
+                rows.append(merged)
+            else:
+                # too few cols; pad
+                rows.append(parsed + [""] * (n_cols - len(parsed)))
+    
+        try:
+            df = pd.DataFrame(rows, columns=header)
+            return df if not df.empty else None
+        except Exception:
+            return None
+    
+    
+    def _parse_md_row(line: str):
+        # split by pipe and trim
+        return [cell.strip() for cell in line.strip("|").split("|")]
+    
+    
+    # =====================================================
+    # Test Case ID renumbering
+    # =====================================================
+    
+    '''def _renumber_ids(df: pd.DataFrame, bp_name: str) -> pd.DataFrame:
+        """
+        If 'Test Case ID' column exists, overwrite with acronym+sequence.
+        """
+        if df is None or df.empty:
+            return df
+    
+        if "Test Case ID" not in df.columns:
+            return df
+    
+        words = re.findall(r"[A-Za-z]+", str(bp_name))
+        acronym = "".join(w[0].upper() for w in words) if words else "BP"
+    
+        df2 = df.copy()
+        df2["Test Case ID"] = [acronym + str(i + 1).zfill(4) for i in range(len(df2))]
+        return df2
+    '''
+    
+    # ---- 1) Validate inputs ----
+    if not filename or not str(filename).strip():
+        return {"error": "Missing required filename (XLSX artifact name)"}
+
+    safe_convid = _safe_id(conversationid) if conversationid else uuid.uuid4().hex
+
+    # ---- 2) Read XLSX artifact bytes (try common prefixes) ----
+    raw_bytes = _get_artifact_bytes_anywhere(filename)
+    if raw_bytes is None:
+        return {
+            "error": f"Could not fetch XLSX artifact '{filename}'. "
+                     f"Tried common locations like uploaded_artifacts/ and artifacts/."
+        }
+
+    # ---- 3) Load into DataFrame (no keep_default_na so blanks stay blanks) ----
+    try:
+        df_in = pd.read_excel(io.BytesIO(raw_bytes), engine="openpyxl", keep_default_na=False)
+    except Exception as e:
+        return {"error": f"Failed to read Excel file as DataFrame: {e}"}
+
+    if df_in is None or df_in.empty:
+        return {"error": "Excel file loaded but contains no rows"}
+
+    # ---- 4) Convert DataFrame -> CSV text (this is the payload sent to Claude) ----
+    # NOTE: We are NOT writing this CSV to disk; we just embed it in the prompt.
+    csv_text = df_in.to_csv(index=False)
+    # ---- 5) Fetch Claude credentials ----
+    try:
+        credentials = core.get_secret("SCA_WA_Claude_Opus_4_6")
+    except Exception as e:
+        return {"error": f"Failed to retrieve Claude credentials: {e}"}
+
+    # ---- 6) Build prompt (single-pass, CSV-in) ----
+    prompt = _build_prompt_from_csv(csv_text)
+
+    # ---- 7) Call Claude ----
+    try:
+        markdown = _call_claude(credentials=credentials, prompt=prompt, max_tokens=8000)
+        print(markdown)
+    except requests.exceptions.Timeout:
+        return {"error": "Claude call timed out"}
+    except Exception as e:
+        return {"error": f"Claude call failed: {e}"}
+
+    if not markdown or not str(markdown).strip():
+        return {"error": "Claude returned an empty response"}
+
+    # ---- 8) Clean and parse markdown -> DataFrame ----
+    cleaned = _clean_text(markdown)
+    df_out = _markdown_to_df(cleaned)
+
+    df_out.columns = [
+        "Buisness process Name",
+        "Test Case ID",
+        "Test Scenario",
+        "Security Role",
+        "Test Data / Inputs",
+        "Test Case Description",
+        "Test Steps",
+        "Expected Result",
+    ]
+
+    if df_out is None or df_out.empty:
+        # Return preview for debugging while still being safe
+        return {
+            "error": "Claude did not return a valid markdown table",
+            "claude_preview": cleaned[:1500]
+        }
+
+    # ---- 10) Write output CSV artifact ----
+    output_name = f"TestCaseGenerated_{safe_convid}.csv"
+    out_buf = io.BytesIO()
+    df_out.to_csv(out_buf, index=False, encoding="utf-8-sig")
+    out_buf.seek(0)
+    key1 = f"uploaded_artifacts/{output_name}"
+    # Many of your existing scripts use "artifacts/<name>" when writing.
+    core.write_artifact(key1, out_buf.getvalue())
+
+    # Existing pattern: presigned url expects bare filename in some environments.
+    # If your environment expects "artifacts/<name>", change accordingly.
+    try:
+        url = core.generate_presigned_url(output_name)
+    except Exception:
+        # fallback attempt if environment expects prefix
+        url = core.generate_presigned_url("artifacts/" + output_name)
+
+    return {
+        "file_name": output_name,
+        "input_rows": int(len(df_in)),
+        "output_rows": int(len(df_out)),
+        "download_url": url,
+        "columns": list(df_out.columns)
+    }
+
+    

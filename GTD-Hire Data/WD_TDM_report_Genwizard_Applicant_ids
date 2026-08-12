@@ -1,0 +1,78 @@
+import typing
+import core
+import json
+import requests
+
+def WD_TDM_report_Genwizard_Applicant_ids(
+    ReportName: typing.Annotated[str, "Name of the report"] = "Genwiz_applicant_ids"):
+    """
+    Fetches the full Genwiz applicant ids report from Workday.
+
+    Args:
+        ReportName: The name of the Workday report to fetch.
+
+    Returns:
+        A dict containing the report data, or an error dict on failure.
+    """
+
+    # 1. Securely fetch credentials
+    CREDENTIALS_KEY = "wd_gtd_dpt10"
+    credentials = core.get_secret(CREDENTIALS_KEY)
+
+    # 2. Validate credentials before proceeding
+    if not credentials:
+        return {"error": f"No credentials found for key '{CREDENTIALS_KEY}'."}
+
+    base_url = credentials.get("baseurl")
+    username = credentials.get("username")
+    password = credentials.get("password")
+
+    if not all([base_url, username, password]):
+        return {
+            "error": "Incomplete credentials. 'baseurl', 'username', and 'password' are all required.",
+            "missing_fields": [k for k, v in {"baseurl": base_url, "username": username, "password": password}.items() if not v]
+        }
+
+    # 3. Build the complete URL safely
+    # FIX: complete_url is now always assigned, regardless of trailing slash
+    base_url = base_url.rstrip("/")
+    complete_url = f"{base_url}/{ReportName}"
+
+    auth = (username, password)
+    params = {"format": "json"}
+
+    # 4. Make the request with proper error handling
+    response = None  # FIX: pre-initialize so except blocks can safely reference it
+    try:
+        response = requests.get(complete_url, auth=auth, params=params, timeout=60)
+        response.raise_for_status()
+        return response.json()
+
+    except requests.exceptions.HTTPError as http_err:
+        return {
+            "error": f"HTTP error occurred: {http_err}",
+            "status_code": response.status_code if response is not None else "N/A"
+        }
+
+    except requests.exceptions.ConnectionError:
+        return {
+            "error": f"Failed to connect to the Workday server at '{complete_url}'. Check the URL and your network."
+        }
+
+    except requests.exceptions.Timeout:
+        return {
+            "error": f"Request timed out after 60 seconds while connecting to '{complete_url}'."
+        }
+
+    except (requests.exceptions.JSONDecodeError, ValueError):
+        return {
+            "error": "Response received but is not valid JSON.",
+            "status_code": response.status_code if response is not None else "N/A",
+            "raw_response": response.text[:500] if response is not None else "N/A"  # Limit raw output
+        }
+
+    except requests.exceptions.RequestException as req_err:
+        return {"error": f"A requests error occurred: {str(req_err)}"}
+
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {str(e)}"}

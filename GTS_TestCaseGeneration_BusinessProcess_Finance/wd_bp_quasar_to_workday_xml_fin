@@ -1,0 +1,366 @@
+import typing
+import json
+import io
+import core
+import re
+import requests
+
+def wd_bp_quasar_to_workday_xml_fin(bp_input_json: typing.Annotated[str, "JSON string containing bp_list array"] = None, 
+    filename: typing.Annotated[str, "Base filename without extension"] = None, 
+    conversationid: typing.Annotated[str, "Conversation identifier"] = None):
+
+
+    print("[DEBUG] ---- FUNCTION START ----")
+    print(f"[DEBUG] Inputs => bp_input_json={bp_input_json!r}, filename={filename!r}, conversationid={conversationid!r}")
+
+    # ---- 1. Parse BP list ----
+    if not bp_input_json:
+        print("[DEBUG] STEP 1 FAILED: bp_input_json is missing or empty")
+        return {"error": "Missing required bp_input_json"}
+
+    def parse_bp_input(raw_input):
+        try:
+            parsed = json.loads(raw_input)
+        except Exception:
+            parsed = raw_input
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, dict):
+            if "bp_list" in parsed:
+                return parsed.get("bp_list", [])
+            if "BusinessProcessName" in parsed:
+                return parsed.get("BusinessProcessName", [])
+        if isinstance(parsed, str):
+            try:
+                inner = json.loads(parsed)
+                if isinstance(inner, list):
+                    return inner
+            except Exception:
+                pass
+            if "," in parsed:
+                return [x.strip() for x in parsed.split(",")]
+            return [parsed.strip()]
+        return []
+
+    bp_list = list({
+        bp.strip()
+        for bp in parse_bp_input(bp_input_json)
+        if isinstance(bp, str) and bp.strip()
+    })
+    print(f"[DEBUG] STEP 1 DONE: Parsed bp_list={bp_list}")
+
+    if not bp_list:
+        print("[DEBUG] STEP 1 FAILED: bp_list is empty after parsing")
+        return {"error": "No valid Business Processes found"}
+
+    # ---- 2. Quasar token ----
+    print("[DEBUG] STEP 2 START: Fetching Quasar token")
+    try:
+        quasar_creds   = core.get_secret("wd-tool-secrets")
+        quasar_baseurl = quasar_creds.get("quasar_baseurl")
+        print(f"[DEBUG] STEP 2: quasar_baseurl={quasar_baseurl!r}")
+        token_resp = requests.post(
+            f"{quasar_baseurl}/atr-gateway/identity-management/api/v1/auth/short-token?useDeflate=true",
+            headers={"Content-Type": "application/json"},
+            json={
+                "username": quasar_creds.get("quasar_username"),
+                "password": quasar_creds.get("quasar_password")
+            },
+            timeout=30
+        )
+        print(f"[DEBUG] STEP 2: Token response status={token_resp.status_code}")
+        token_resp.raise_for_status()
+        token = token_resp.json().get("token")
+        if not token:
+            print("[DEBUG] STEP 2 FAILED: Token is None or empty in response")
+            return {"error": "Failed to retrieve Quasar token"}
+        print(f"[DEBUG] STEP 2 DONE: Token retrieved successfully (length={len(token)})")
+    except Exception as e:
+        print(f"[DEBUG] STEP 2 FAILED: Exception => {str(e)}")
+        return {"error": f"Quasar token generation failed: {str(e)}"}
+
+    # ---- 3. Process each BP: Quasar search → Workday XML call ----
+    print("[DEBUG] STEP 3 START: Loading Claude credentials")
+    results            = []
+    processing_summary = []
+    try:
+        credentials = core.get_secret("SCA_WA_Claude_Opus_4_6")
+        print(f"[DEBUG] STEP 3: Claude credentials loaded, keys={list(credentials.keys())}")
+    except Exception as e:
+        print(f"[DEBUG] STEP 3 FAILED: Could not load Claude credentials => {str(e)}")
+        raise
+
+    def normalize_string(s):
+        return re.sub(r"[\s_()]+", "", s.strip().lower())
+
+    for bp_name in bp_list:
+        print(f"\n[DEBUG] ---- Processing BP: {bp_name!r} ----")
+        try:
+            # --- Quasar search ---
+            print(f"[DEBUG] BP={bp_name!r}: Sending Quasar search request")
+            q_payload = {
+                "output": "<referenceID>",
+                "query": f'@metadata:BP_Definition_HCM.xlsx @content:"{bp_name}"',
+                "index": "wd_TSEndtoEndTesting_idx",
+                "search_limit": "10"
+            }
+            q_headers = {
+                "accept": "application/json",
+                "content-type": "application/json",
+                "apiToken": token
+            }
+            q_resp = requests.post(
+                f"{quasar_baseurl}/api/v2/acnopenai/searchvectors",
+                headers=q_headers,
+                json=q_payload,
+                timeout=60
+            )
+            print(f"[DEBUG] BP={bp_name!r}: Quasar search status={q_resp.status_code}")
+            if q_resp.status_code != 200:
+                print(f"[DEBUG] BP={bp_name!r}: Quasar search FAILED, response={q_resp.text[:300]}")
+                processing_summary.append({"bp_name": bp_name, "status": "Quasar Failed"})
+                continue
+
+            quasar_result = q_resp.json()
+            print(f"[DEBUG] BP={bp_name!r}: Quasar result type={type(quasar_result).__name__}, value={str(quasar_result)[:300]}")
+            if not isinstance(quasar_result, list):
+                print(f"[DEBUG] BP={bp_name!r}: Quasar response is not a list, skipping")
+                processing_summary.append({"bp_name": bp_name, "status": "Invalid Quasar Response"})
+                continue
+
+            target_normalized = normalize_string(f"{bp_name} (default definition)")
+            print(f"[DEBUG] BP={bp_name!r}: Searching for normalized target={target_normalized!r}")
+            reference_id = next(
+                (ref for ref in quasar_result
+                 if normalize_string(str(ref)) == target_normalized),
+                None
+            )
+            print(f"[DEBUG] BP={bp_name!r}: reference_id={reference_id!r}")
+            if not reference_id:
+                print(f"[DEBUG] BP={bp_name!r}: Reference ID not found in Quasar results")
+                processing_summary.append({"bp_name": bp_name, "status": "Reference Not Found"})
+                continue
+
+            # --- Workday XML call ---
+            print(f"[DEBUG] BP={bp_name!r}: Sending Workday XML request with reference_id={reference_id!r}")
+            wd_creds = core.get_secret("wd_dnt_10")
+            print(f"[DEBUG] BP={bp_name!r}: Workday baseurl={wd_creds.get('baseurl')!r}")
+            wd_resp  = requests.get(
+                f"{wd_creds.get('baseurl')}/ccx/service/customreport2/accenture_dpt10/madhavi.vangara/JN_Business_Process_Definition_Detail",
+                params={"Definition!Business_Process_Definition_ID": reference_id},
+                auth=(wd_creds.get("username"), wd_creds.get("password")),
+                timeout=60
+            )
+            print(f"[DEBUG] BP={bp_name!r}: Workday response status={wd_resp.status_code}")
+            if wd_resp.status_code != 200:
+                print(f"[DEBUG] BP={bp_name!r}: Workday call FAILED, response={wd_resp.text[:300]}")
+                processing_summary.append({"bp_name": bp_name, "status": "Workday Failed"})
+                continue
+
+            xml_data = wd_resp.text
+            print(f"[DEBUG] BP={bp_name!r}: Workday XML received, length={len(xml_data)} chars")
+
+            # ---- 4. Claude call to extract step details from XML ----
+            print(f"[DEBUG] BP={bp_name!r}: Calling Claude for extraction")
+            try:
+                extracted_text = _call_claude_extract(credentials, bp_name, xml_data)
+                print(f"[DEBUG] BP={bp_name!r}: Claude response length={len(extracted_text) if extracted_text else 0}")
+            except Exception as e:
+                print(f"[DEBUG] BP={bp_name!r}: Claude call FAILED => {str(e)}")
+                processing_summary.append({"bp_name": bp_name, "status": f"Claude Error: {str(e)}"})
+                continue
+
+            if not extracted_text:
+                print(f"[DEBUG] BP={bp_name!r}: Claude returned empty extraction")
+                processing_summary.append({"bp_name": bp_name, "status": "Claude extraction returned empty"})
+                continue
+
+            print(f"[DEBUG] BP={bp_name} extraction preview:\n{extracted_text[:500]}\n" + "─"*60)
+
+            results.append({
+                "bp_name":        bp_name,
+                "reference_id":   reference_id,
+                "xml_data":       xml_data,
+                "extracted_steps": extracted_text
+            })
+            processing_summary.append({"bp_name": bp_name, "status": "Success"})
+            print(f"[DEBUG] BP={bp_name!r}: Successfully processed")
+
+        except Exception as e:
+            print(f"[DEBUG] BP={bp_name!r}: Unhandled exception => {str(e)}")
+            processing_summary.append({"bp_name": bp_name, "status": f"Error: {str(e)}"})
+
+    print(f"\n[DEBUG] STEP 3 DONE: processing_summary={processing_summary}")
+
+    if not results:
+        print("[DEBUG] FINAL: No BPs successfully processed, returning error")
+        return {
+            "error":   "No Business Processes successfully processed",
+            "summary": processing_summary
+        }
+
+    # ---- 5. Build combined extracted details text and save to S3 ----
+    print("[DEBUG] STEP 5 START: Building combined text and saving to S3")
+    combined_text = ""
+    for entry in results:
+        combined_text += (
+            "\n" + "="*80 + "\n"
+            f"Business Process: {entry['bp_name']}\n"
+            f"Reference ID:     {entry['reference_id']}\n"
+            + "="*80 + "\n"
+            f"{entry['extracted_steps']}\n"
+        )
+
+    safe_filename       = re.sub(r'[^A-Za-z0-9_\-]', '_', filename or "bp_extracted_steps")
+    safe_conversationid = re.sub(r'[^A-Za-z0-9_\-]', '_', conversationid or "")
+    final_file_name     = f"{safe_filename}_{safe_conversationid}.txt"
+    print(f"[DEBUG] STEP 5: final_file_name={final_file_name!r}, combined_text length={len(combined_text)}")
+
+    try:
+        file_buffer = io.BytesIO(combined_text.encode("utf-8"))
+        core.write_artifact("artifacts/" + final_file_name, file_buffer)
+        print("[DEBUG] STEP 5: Artifact written successfully")
+    except Exception as e:
+        print("[DEBUG] STEP 5 FAILED: write_artifact error => " + str(e))
+        raise
+
+    try:
+        download_url = core.generate_presigned_url(final_file_name)
+        print(f"[DEBUG] STEP 5: Presigned URL generated => {download_url!r}")
+    except Exception as e:
+        print(f"[DEBUG] STEP 5 FAILED: generate_presigned_url error => {str(e)}")
+        raise
+
+    print("[DEBUG] ---- FUNCTION END: Returning final result ----")
+    return {
+        "file_name":      final_file_name,
+        "download_url":   download_url,
+        "total_bps":      len(bp_list),
+        "successful":     len(results),
+        "results":        results,        # list of {bp_name, reference_id, xml_data, extracted_steps}
+        "summary":        processing_summary
+    }
+
+
+# =====================================================
+# CONFIG
+# =====================================================
+MAX_TOKENS = 8000
+
+
+# =====================================================
+# HELPERS
+# =====================================================
+def _build_extraction_prompt(bp_name: str, xml_data: str) -> str:
+    return f"""## Goal: Extract Workday Business Process Step Details from XML
+
+## INSTRUCTIONS
+You are a Workday XML parser. Your job is to read the XML provided between
+--- START OF XML FOR {bp_name} --- and --- END OF XML FOR {bp_name} ---
+and extract the step details into a clean structured table.
+
+## EXTRACTION RULES
+- Read EVERY wd:Steps_group element in the XML from top to bottom. Do NOT skip any.
+- For each wd:Steps_group extract the following fields exactly as they appear in the XML:
+    1. wd:Order                → The step sequence value (e.g. a, a.1, a.2, b, c, d ...)
+    2. wd:Step wd:Descriptor   → The step name/descriptor text
+    3. wd:Type wd:Descriptor   → The step type: one of Initiation / Action / To Do / Approval / Service / Edit Additional Data
+    4. wd:Triggers wd:Descriptor             → The action triggered, if present. Leave blank if not present.
+    5. wd:Specify_Todo wd:Descriptor         → The To Do task name, if present. Leave blank if not present.
+    6. wd:If wd:Descriptor                   → The condition text. If multiple wd:If elements exist for a step, record ALL of them separated by " | ". Leave blank if not present.
+    7. wd:Groups wd:Descriptor               → The primary assigned security group. Leave blank if not present.
+    8. wd:Alternate_Security_Groups_from_Routing_Restrictions wd:Descriptor → The alternate security group, if present. Leave blank if not present.
+    9. wd:Completion_Step                    → The value: 0 or 1. If not present, use 0.
+    10. wd:Due_Date_Is_Based_On_Effective_Date → The value: 0 or 1. If not present, use 0.
+
+- Extract values VERBATIM from the XML. Do NOT paraphrase, summarize, or invent any value.
+- If a field element is missing from a step, leave that cell blank — do NOT write "N/A" or "None".
+- The wd:Descriptor attribute may appear as an XML attribute OR as child element text — check both.
+
+## OUTPUT FORMAT
+Output a markdown table with EXACTLY these column headers in this order:
+
+| wd:Order | wd:Step wd:Descriptor | wd:Type wd:Descriptor | wd:Triggers wd:Descriptor | wd:Specify_Todo wd:Descriptor | wd:If wd:Descriptor | wd:Groups wd:Descriptor | wd:Alternate_Security_Groups_from_Routing_Restrictions wd:Descriptor | wd:Completion_Step | wd:Due_Date_Is_Based_On_Effective_Date |
+
+- Output the table and NOTHING ELSE.
+- Do NOT add any text, explanation, or commentary before or after the table.
+- Do NOT wrap the table in code fences.
+- The VERY FIRST character of your response must be the pipe character: |
+- The VERY LAST character of your response must be a pipe character: |
+- Every row must have exactly 10 pipe-delimited columns.
+- One row per wd:Steps_group — do NOT merge or skip any step.
+
+--- START OF XML FOR {bp_name} ---
+{xml_data}
+--- END OF XML FOR {bp_name} ---
+"""
+
+
+def _call_claude_extract(credentials: dict, bp_name: str, xml_data: str) -> str:
+    """Call Claude to extract step details from raw Workday XML."""
+    print("[DEBUG] _call_claude_extract: START for bp_name=" + repr(bp_name))
+    prompt = _build_extraction_prompt(bp_name, xml_data)
+    print("[DEBUG] _call_claude_extract: Prompt built, length=" + str(len(prompt)) + " chars")
+
+    endpoint   = credentials.get("Endpoint", "").rstrip("/")
+    deployment = credentials.get("deployment_name")
+    api_key    = credentials.get("api_key")
+
+    base_url = endpoint + "/anthropic/v1/messages"
+    headers = {
+        "x-api-key":         api_key,
+        "Content-Type":      "application/json",
+        "anthropic-version": "2023-06-01"
+    }
+
+    print("[DEBUG] _call_claude_extract: deployment=" + repr(deployment) + ", base_url=" + repr(base_url))
+
+    messages  = [{"role": "user", "content": prompt}]
+    full_text = ""
+
+    try:
+        while True:
+            payload = {
+                "model":       deployment,
+                "max_tokens":  MAX_TOKENS,
+                "temperature": 0,
+                "messages":    messages
+            }
+
+            print("[DEBUG] _call_claude_extract: Sending request, message count=" + str(len(messages)))
+            resp = requests.post(base_url, headers=headers, json=payload, timeout=(10, 300))
+            print("[DEBUG] _call_claude_extract: Response status=" + str(resp.status_code))
+            raw = resp.text
+            print("[DEBUG] _call_claude_extract: Raw response (first 500 chars) => " + raw[:500])
+
+            if not raw.strip():
+                print("[DEBUG] _call_claude_extract: FAILED - response body is empty")
+                return ""
+
+            resp.raise_for_status()
+            data = resp.json()
+            print("[DEBUG] _call_claude_extract: Response keys=" + str(list(data.keys())))
+
+            chunk = data["content"][0]["text"]
+            full_text += chunk
+            print("[DEBUG] _call_claude_extract: Chunk length=" + str(len(chunk)) + ", total so far=" + str(len(full_text)))
+
+            # Stop if Claude finished naturally
+            if data.get("stop_reason") != "max_tokens":
+                print("[DEBUG] _call_claude_extract: stop_reason=" + repr(data.get("stop_reason")) + ", done")
+                break
+
+            # Continue if response was cut off at max_tokens
+            print("[DEBUG] _call_claude_extract: stop_reason=max_tokens, continuing...")
+            messages.append({"role": "assistant", "content": chunk})
+            messages.append({
+                "role": "user",
+                "content": "Continue from exactly where you stopped. Do not repeat content."
+            })
+
+        print("[DEBUG] _call_claude_extract: Final extracted text length=" + str(len(full_text)))
+        return full_text
+
+    except Exception as e:
+        print("[DEBUG] _call_claude_extract: Request failed => " + str(e))
+        return ""

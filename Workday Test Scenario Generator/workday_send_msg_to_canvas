@@ -1,0 +1,87 @@
+import typing
+import core
+import requests
+import json
+
+def workday_send_msg_to_canvas(conversation_id: typing.Annotated[str, "chat id from CUI"] = None, 
+    message: typing.Annotated[str, "messsage to send to canvas"] = None, 
+    environment: typing.Annotated[str, "CUI environment name"] = None, 
+    recipient_id: typing.Annotated[str, "recepient ID from chat"] = None):
+    if not environment:
+        creds = core.get_secret("workday_CUI")
+    else:
+        environment = environment.lower()
+
+        if environment == "prod":
+            creds = core.get_secret("cs_atr_prod")
+        elif environment == "demo":
+            creds = core.get_secret("workday_CUI")
+        elif environment == "stagetest":
+            creds = core.get_secret("cs-atr-stgtest")
+        elif environment == "dev":
+            creds = core.get_secret("cs_atr_dev")
+        elif environment == "sapcui":
+            creds = core.get_secret("cui_sap_cred")
+        elif environment == "platforms-dev":
+            creds = core.get_secret("atr_bg_cred")
+        elif environment == "next-gen":
+            creds = core.get_secret("nextgencui")
+        else:
+            return {"error": f"Unknown environment: {environment}"}
+    url_base = creds.get("url")
+        
+    
+    def generate_token():
+        print("Generating token for ", url_base,creds.get("password"),creds.get("username"))
+        url = f"{url_base}/atr-gateway/identity-management/api/v1/auth/short-token"
+        headers = {"Content-Type": "application/json"}
+        body = {"username": creds.get("username"), "password": creds.get("password")}
+        
+        response = requests.post(url, json=body, headers=headers)
+        token = response.json()["token"]
+        print("Generating token successful ",)
+        return token
+    
+    def get_token():
+        # token = core.get_local_value("token")
+        # if not token:
+        #   token = generate_token()
+        #   core.set_local_value("token", token)
+        token = generate_token()
+        return token
+    
+    def send_message(token, conversation_id, content):
+        headers = {"apiToken": token}
+        url = f"{url_base.rstrip('/')}/atr-gateway/genai/messages"
+        body = {
+            "conversation_id": conversation_id,
+            "content": content,
+            "type": "assistant",
+            "metadata": {
+                "external_system_name": "agent_manager",
+                "external_system_be_replied": False,
+                "external_system_message_type": "text",
+                "external_system_response_id": "",
+                "external_configs": {}
+            }
+        }
+
+        if environment in{"stagetest","prod","demo","platforms-dev","next-gen"}:
+            body["recipient_id"] = recipient_id
+                
+        response = requests.post(url, json=body, headers=headers)
+        if response.status_code == 200:
+            return "Message successfully sent to the Canvas."
+        else:
+            return response.raise_for_status()
+    
+    try:
+        token = get_token()
+        result = send_message(token, conversation_id, message)
+        return result
+    except Exception as e:
+        
+        return json.dumps({
+            "error": f"Error sending message to canvas: {str(e)}"
+        }, indent=2)
+

@@ -1,0 +1,860 @@
+import typing
+import json
+import io
+import core
+import re
+import pandas
+import uuid
+import requests
+
+def wd_bp_quasar_xml_to_csv_pll(conversationid: typing.Annotated[str, "Conversation identifier"] = None):
+
+
+    """
+    Reads S3 file named XML_Details_{conversationid}.txt via core.get_artifact,
+    splits it into anonymous BP chunks, sends each chunk to Claude in PARALLEL,
+    Claude infers the BP name from step data, results combined into one CSV.
+
+    Parallel optimisation (no new top-level imports):
+    - concurrent.futures imported locally at point of use
+    - Each thread gets its own requests.Session (thread-safe)
+    - Chunk order preserved via indexed result slots
+    - Wall-clock time ≈ one Claude call duration regardless of chunk count
+    """
+
+    # ---- 1. Validate inputs ----
+    if not conversationid or not conversationid.strip():
+        return {"error": "Missing required conversationid"}
+
+    safe_convid = re.sub(r'[^A-Za-z0-9_\-]', '_', conversationid.strip())
+
+    # ---- 2. Fetch file using core.get_artifact (artifacts/ prefix required) ----
+    candidates = [
+        "artifacts/XML_Details_" + safe_convid + ".txt",
+        "artifacts/xml_details_" + safe_convid + ".txt"
+    ]
+    full_file_text  = None
+    input_file_name = None
+
+    for candidate in candidates:
+        print("[DEBUG] Trying core.get_artifact: " + candidate)
+        try:
+            raw = core.get_artifact(candidate, text=True)
+            if not raw:
+                print("[DEBUG] '" + candidate + "' returned empty — skipping")
+                continue
+            body = str(raw).strip()
+            if body.lower().startswith("<!doctype") or body.lower().startswith("<html"):
+                print("[DEBUG] '" + candidate + "' returned HTML page — skipping")
+                continue
+            full_file_text  = body
+            input_file_name = candidate
+            print("[DEBUG] Successfully fetched: " + candidate + " (" + str(len(full_file_text)) + " chars)")
+            break
+        except Exception as e:
+            print("[DEBUG] core.get_artifact failed for '" + candidate + "': " + str(e))
+            continue
+
+    if not full_file_text or not input_file_name:
+        return {
+            "error": (
+                "Could not fetch file for conversationid='" + conversationid + "'. "
+                "Tried: " + str(candidates) + ". "
+                "Ensure the extraction tool was run first with the same conversationid."
+            )
+        }
+
+    print("[DEBUG] Raw file content preview:\n" + full_file_text[:500])
+
+    # ---- 3. Split file into anonymous chunks ----
+    chunks = _split_into_chunks(full_file_text)
+    if not chunks:
+        return {"error": "No BP sections found in file: " + input_file_name}
+
+    print("[DEBUG] Total chunks found: " + str(len(chunks)))
+    for c in chunks:
+        print("[DEBUG]   chunk_id=" + c['chunk_id'] + "  chars=" + str(len(c['content'])))
+
+    # ---- 4. Claude credentials ----
+    try:
+        credentials = core.get_secret("SCA_WA_Claude_Opus_4_6")
+    except Exception as e:
+        return {"error": "Failed to retrieve Claude credentials: " + str(e)}
+
+    max_tokens = 8000
+
+    # =====================================================
+    # PARALLEL CLAUDE CALLS
+    #
+    # MAX_WORKERS=8:
+    #   All chunks fire simultaneously (I/O bound).
+    #   Wall-clock time ≈ one Claude call duration (~75–120s)
+    #   regardless of total chunk count.
+    #   Tune down if you hit API rate limits.
+    #
+    # concurrent.futures imported locally — avoids top-level
+    # import restriction of the tool framework.
+    # =====================================================
+    MAX_WORKERS = 8
+
+    # ── Worker — each thread gets its own Session (thread-safe) ──────────────
+    def _process_chunk(args):
+        idx, chunk = args
+        chunk_id = chunk["chunk_id"]
+        content  = chunk["content"]
+        print("[DEBUG] Processing chunk_id=" + chunk_id)
+        print("[DEBUG] Content preview:\n" + content[:400] + "\n" + "─" * 60)
+
+        # New session per thread — avoids shared-state race conditions
+        thread_session = requests.Session()
+        try:
+            prompt   = _build_claude_prompt(chunk_id, content)
+            markdown = _call_claude_with_session(thread_session, credentials, prompt, max_tokens)
+
+            if not markdown:
+                msg = "Empty Claude response for chunk_id=" + chunk_id
+                print("[WARNING] " + msg)
+                return idx, None, None, {"chunk_id": chunk_id, "status": "Failed", "reason": msg}
+
+            print("[DEBUG] chunk_id=" + chunk_id + " Claude response preview:\n" + markdown[:800] + "\n" + "─" * 60)
+
+            markdown = _clean_text(markdown)
+            inferred_bp, clean_markdown = _extract_inferred_bp(markdown)
+            print("[DEBUG] chunk_id=" + chunk_id + " inferred BP='" + inferred_bp + "'")
+
+            df = _markdown_to_df(clean_markdown)
+            if df is None:
+                print("[DEBUG] Full failed Claude response for chunk_id=" + chunk_id + ":\n" + markdown + "\n" + "─" * 60)
+                msg = "No valid markdown table returned by Claude for chunk_id=" + chunk_id
+                return idx, None, inferred_bp, {
+                    "chunk_id":    chunk_id,
+                    "inferred_bp": inferred_bp,
+                    "status":      "Failed",
+                    "reason":      msg
+                }
+
+            df = _renumber_ids(df, inferred_bp)
+            df.insert(0, "Business Process Name", inferred_bp)
+            return idx, df, inferred_bp, {
+                "chunk_id":       chunk_id,
+                "inferred_bp":    inferred_bp,
+                "status":         "Success",
+                "rows_generated": len(df)
+            }
+
+        except requests.exceptions.Timeout:
+            msg = "Claude call timed out for chunk_id=" + chunk_id
+            print("[WARNING] " + msg)
+            return idx, None, None, {"chunk_id": chunk_id, "status": "Failed", "reason": msg}
+        except Exception as e:
+            msg = "Error processing chunk_id=" + chunk_id + ": " + str(e)
+            print("[ERROR] " + msg)
+            return idx, None, None, {"chunk_id": chunk_id, "status": "Failed", "reason": msg}
+
+    # ── Dispatch all chunks in parallel ──────────────────────────────────────
+    # Pre-allocate ordered result slots to preserve chunk order in final CSV
+    ordered_results    = [None] * len(chunks)   # df per slot
+    processing_summary = [None] * len(chunks)   # summary per slot
+
+    import concurrent.futures  # local import — avoids top-level restriction
+
+    tasks = [(idx, chunk) for idx, chunk in enumerate(chunks)]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(_process_chunk, task): task for task in tasks}
+        for future in concurrent.futures.as_completed(futures):
+            idx, df, inferred_bp, summary = future.result()
+            ordered_results[idx]    = df       # None if failed — filtered below
+            processing_summary[idx] = summary
+
+    # ── Assemble final dataframe in original chunk order ─────────────────────
+    combined_df_list = [df for df in ordered_results if df is not None]
+    processing_summary = [s for s in processing_summary if s is not None]
+
+    # ---- 5. Generate combined output CSV ----
+    if not combined_df_list:
+        return {
+            "error":   "No chunks successfully processed",
+            "summary": processing_summary
+        }
+
+    final_df        = pandas.concat(combined_df_list, ignore_index=True)
+    final_file_name = "TestCaseGenerated_" + safe_convid + ".csv"
+
+    csv_buffer = io.BytesIO()
+    final_df.to_csv(csv_buffer, index=False, encoding="utf-8-sig")
+    csv_buffer.seek(0)
+    core.write_artifact("artifacts/" + final_file_name, csv_buffer.getvalue())
+    output_url = core.generate_presigned_url(final_file_name)
+
+    successful = [s for s in processing_summary if s["status"] == "Success"]
+    failed     = [s for s in processing_summary if s["status"] == "Failed"]
+
+    return {
+        "file_name":          final_file_name,
+        "source_steps_file":  input_file_name,
+        "total_chunks_found": len(chunks),
+        "successful_chunks":  len(successful),
+        "failed_chunks":      len(failed),
+        "total_rows":         len(final_df),
+        "download_url":       output_url,
+        "summary":            processing_summary
+    }
+
+
+# =====================================================
+# CLAUDE CALL — session-aware version for parallel use
+# (original _call_claude signature kept below for
+#  any other callers; this variant accepts a session)
+# =====================================================
+
+def _call_claude_with_session(session: requests.Session, credentials: dict, prompt: str, max_tokens: int) -> str:
+    base_url = credentials.get("Endpoint", "").rstrip("/") + "/anthropic/v1/messages"
+    api_key  = credentials.get("api_key")
+    model    = credentials.get("deployment_name")
+
+    headers = {
+        "x-api-key":         api_key,
+        "Content-Type":      "application/json",
+        "anthropic-version": "2023-06-01"
+    }
+
+    messages  = [{"role": "user", "content": prompt}]
+    full_text = ""
+
+    while True:
+        payload = {
+            "model":       model,
+            "max_tokens":  max_tokens,
+            "temperature": 0.2,
+            "messages":    messages
+        }
+        resp = session.post(base_url, headers=headers, json=payload, timeout=(10, 300))
+        resp.raise_for_status()
+        data  = resp.json()
+        chunk = "".join(item.get("text", "") for item in data.get("content", [])).strip()
+        full_text += chunk
+
+        if data.get("stop_reason") != "max_tokens":
+            break
+
+        messages.append({"role": "assistant", "content": chunk})
+        messages.append({
+            "role":    "user",
+            "content": "Continue from exactly where you stopped. Do not repeat content."
+        })
+
+    return full_text
+
+
+def _call_claude(credentials: dict, prompt: str, max_tokens: int) -> str:
+    """Original signature — creates its own session. Kept for compatibility."""
+    return _call_claude_with_session(requests.Session(), credentials, prompt, max_tokens)
+
+
+# =====================================================
+# HELPER FUNCTIONS  (unchanged from original)
+# =====================================================
+
+def _clean_text(text: str) -> str:
+    """Remove encoding artifacts and HTML tags from Claude response."""
+    if not text:
+        return text
+    replacements = {
+        'â€"':    '—',
+        'â€™':    "'",
+        'â€œ':    '"',
+        'â€\x9d': '"',
+        'â€¦':    '...',
+        'â€¢':    '-',
+        'Â ':     ' ',
+        'â€˜':    "'",
+        '&amp;':  '&',
+        '&lt;':   '<',
+        '&gt;':   '>',
+        '&nbsp;': ' ',
+    }
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r' {2,}', ' ', text)
+    return text.strip()
+
+
+def _sanitise_header(header_text: str) -> str:
+    lines     = header_text.splitlines()
+    sanitised = [
+        line for line in lines
+        if not re.match(r'\s*Business Process\s*:', line, re.IGNORECASE)
+    ]
+    return "\n".join(sanitised).strip()
+
+
+def _split_into_chunks(full_file_text: str) -> list:
+    """
+    Splits the S3 file into anonymous chunks.
+    File structure:
+        ={80}
+        Business Process: Hire
+        Reference ID: Hire_Default_Definition
+        ={80}
+        | wd:Order | wd:Step ...   <- table rows
+        ={80}                      <- next BP or EOF
+    """
+    section_separator = re.compile(r'={40,}')
+    parts             = [p.strip() for p in section_separator.split(full_file_text)]
+
+    print("[DEBUG] Total parts after split: " + str(len(parts)))
+    for idx, p in enumerate(parts):
+        print("[DEBUG] parts[" + str(idx) + "] preview: " + repr(p[:120]))
+
+    chunks = []
+    i      = 0
+    while i < len(parts):
+        part = parts[i]
+        if re.search(r'Business Process:', part, re.IGNORECASE):
+            content_part = parts[i + 1] if (i + 1) < len(parts) else ""
+            if content_part and content_part.startswith("|"):
+                header_sanitised = _sanitise_header(part)
+                full_chunk       = header_sanitised + "\n\n" + content_part
+                chunk_id         = "CHUNK-" + uuid.uuid4().hex[:6].upper()
+                chunks.append({"chunk_id": chunk_id, "content": full_chunk})
+                print("[DEBUG] Created " + chunk_id + " from parts[" + str(i) + "] + parts[" + str(i + 1) + "]")
+                i += 2
+                continue
+            elif (i + 2) < len(parts) and parts[i + 2].startswith("|"):
+                content_part     = parts[i + 2]
+                header_sanitised = _sanitise_header(part)
+                full_chunk       = header_sanitised + "\n\n" + content_part
+                chunk_id         = "CHUNK-" + uuid.uuid4().hex[:6].upper()
+                chunks.append({"chunk_id": chunk_id, "content": full_chunk})
+                print("[DEBUG] Created " + chunk_id + " from parts[" + str(i) + "] + parts[" + str(i + 2) + "]")
+                i += 3
+                continue
+            else:
+                print("[WARNING] Header found at parts[" + str(i) + "] but no table content nearby — skipping")
+        i += 1
+
+    return chunks
+
+
+def _extract_inferred_bp(markdown: str):
+    lines = markdown.strip().splitlines()
+    for i, line in enumerate(lines):
+        match = re.match(r'^\s*INFERRED_BP\s*:\s*(.+)', line, re.IGNORECASE)
+        if match:
+            inferred_name  = match.group(1).strip()
+            clean_markdown = "\n".join(lines[i + 1:]).strip()
+            return inferred_name, clean_markdown
+    print("[WARNING] INFERRED_BP line not found in Claude response — using 'Unknown BP'")
+    return "Unknown BP", markdown.strip()
+
+
+def _markdown_to_df(markdown_output: str):
+    lines       = [line.strip() for line in markdown_output.splitlines() if line.strip()]
+    table_lines = [row for row in lines if row.startswith("|") and row.endswith("|")]
+
+    if len(table_lines) < 2:
+        return None
+
+    sep_re  = re.compile(r'^\|[\s|:\-]+\|$')
+    cleaned = [row for row in table_lines if not sep_re.match(row)]
+
+    if len(cleaned) < 2:
+        return None
+
+    def parse_row(line: str) -> list:
+        return [cell.strip() for cell in line.strip("|").split("|")]
+
+    header = parse_row(cleaned[0])
+    n_cols = len(header)
+    rows   = []
+
+    for raw_row in cleaned[1:]:
+        parsed = parse_row(raw_row)
+        if len(parsed) == n_cols:
+            rows.append(parsed)
+        elif len(parsed) > n_cols:
+            merged = parsed[:n_cols - 1] + [" | ".join(parsed[n_cols - 1:])]
+            rows.append(merged)
+
+    if not rows:
+        return None
+
+    try:
+        df = pandas.DataFrame(rows, columns=header)
+        df = df.applymap(lambda x: _clean_text(x) if isinstance(x, str) else x)
+        return df if not df.empty else None
+    except Exception:
+        return None
+
+
+def _renumber_ids(df: pandas.DataFrame, bp_name: str) -> pandas.DataFrame:
+    if "Test Case ID" not in df.columns:
+        return df
+    words   = re.findall(r'[A-Za-z]+', bp_name)
+    acronym = "".join(w[0].upper() for w in words) if words else "BP"
+    df      = df.copy()
+    df["Test Case ID"] = [acronym + str(i + 1).zfill(4) for i in range(len(df))]
+    return df
+
+
+# =====================================================
+# CLAUDE PROMPT BUILDER  (unchanged from original)
+# =====================================================
+
+def _build_claude_prompt(chunk_id: str, step_details_text: str) -> str:
+    return (
+        "## Goal: Generate Workday Test Cases in Markdown table format.\n\n"
+        "## CHUNK IDENTIFIER\n"
+        "This step data is labelled '" + chunk_id + "' for processing purposes ONLY.\n"
+        "Do NOT use '" + chunk_id + "' anywhere in your output — not in any column, not in any cell.\n"
+        "It is a meaningless processing tag and must be completely invisible in the final table.\n\n"
+
+        "## YOUR FIRST TASK — INFER THE BUSINESS PROCESS NAME\n"
+        "Before generating any test cases, read ALL the step data below completely.\n"
+        "From the step names, security group names, action types, trigger names, and To Do task descriptions,\n"
+        "infer the most likely Workday Business Process name.\n\n"
+        "Output your inferred BP name on the VERY FIRST LINE of your response in this exact format:\n"
+        "INFERRED_BP: <your inferred BP name here>\n\n"
+        "Use proper Workday BP naming convention e.g. \"Hire Employee\", \"Change Job\",\n"
+        "\"Terminate Employee\", \"Create Position\", \"Request Compensation Change\", \"Promote Employee\".\n\n"
+
+        "## CRITICAL OUTPUT RULES\n\n"
+        "After the INFERRED_BP line, output a Markdown table and NOTHING ELSE.\n"
+        "Do NOT write any text, explanation, or commentary before or after the table.\n"
+        "Do NOT wrap the table in code fences (no ```).\n"
+        "The line immediately after INFERRED_BP: <name> must start with: |\n"
+        "The VERY LAST character must be: |\n"
+        "Every row must have exactly 7 pipe-delimited columns.\n"
+        "Do NOT leave any cell blank.\n"
+        "NEVER use Workday internal step order identifiers anywhere in the output table.\n"
+        "This means NEVER write \"step a\", \"step b\", \"step c\", \"step d\", \"step i\", \"step j\",\n"
+        "\"step k\", \"step l\" or any similar order code in ANY column of ANY row.\n\n"
+
+        "## PLAIN ENGLISH LANGUAGE RULE — APPLIES TO EVERY COLUMN\n"
+        "This rule overrides everything else and applies to ALL columns without exception.\n"
+        "ALL output must be written in clear, user-friendly business language.\n"
+        "NEVER copy raw Workday system syntax, condition expressions, or technical strings into any cell.\n"
+        "This includes but is not limited to:\n"
+        "  - Any condition expression copied verbatim from wd:If fields (e.g. '1=0?')\n"
+        "  - Any internal Workday field names, system identifiers, or coded expressions\n"
+        "  - Any condition text that uses system operators like '=', '!=', '?'\n"
+        "Always translate technical conditions and system language into plain, human-readable business English.\n\n"
+        "How to translate conditions:\n"
+        "  - Read the wd:If condition text to understand its business meaning\n"
+        "  - Ask: what real-world business situation does this condition describe?\n"
+        "  - Write that business situation in plain English as the reason\n"
+        "  - For always-FALSE conditions (1=0?): write 'not applicable for this scenario'\n"
+        "  - For business conditions that are FALSE: write what is true in this scenario that causes the skip\n"
+        "  - For business conditions that are TRUE: describe what the step accomplishes\n\n"
+        "Examples of correct translation approach (these are illustrative only — derive your actual\n"
+        "reasons from the specific conditions in YOUR step data):\n"
+        "  WRONG: SKIPPED (Condition: 1=0? = always FALSE)\n"
+        "  RIGHT: SKIPPED — not applicable for this scenario\n"
+        "  WRONG: SKIPPED (Condition: [raw wd:If text] = FALSE)\n"
+        "  RIGHT: SKIPPED — [plain English description of why this step does not apply here]\n"
+        "  WRONG: condition not met\n"
+        "  RIGHT: [specific plain English business reason this step is skipped in this scenario]\n\n"
+
+        "## CONCISENESS RULES — STRICTLY ENFORCED\n"
+        "These rules override everything else for cell content:\n\n"
+        "Column 2 (Test Scenario):\n"
+        "  - MAX 25 words\n"
+        "  - Name ONLY the condition(s) being tested in THIS row and TRUE/FALSE state\n"
+        "  - Written in plain business English — no technical Workday syntax\n"
+        "  - Format: \"[Initiator] initiates [BP] — [condition focus in plain English] — [one-word outcome]\"\n\n"
+        "Column 5 (Test Case Description):\n"
+        "  - MAX 3 sentences\n"
+        "  - Sentence 1: who initiates and what primary condition is being tested, in plain business language\n"
+        "  - Sentence 2: which conditional steps execute or skip as a direct result, explained in plain English\n"
+        "  - Sentence 3: how the process completes\n"
+        "  - NEVER include raw condition syntax or Workday field names in this column\n\n"
+
+        "## ══════════════════════════════════════════════════════════\n"
+        "## COLUMN 6 (Test Steps) — MANDATORY FULL STEP TRACE RULES\n"
+        "## ══════════════════════════════════════════════════════════\n\n"
+        "Column 6 MUST list EVERY step from the process in ORDER from Initiation to final verification.\n"
+        "This is the most important column. Do NOT summarise, skip, or group steps.\n\n"
+        "### HOW TO BUILD COLUMN 6 FOR EACH TEST CASE:\n\n"
+        "STEP 1 — Extract the master step list:\n"
+        "  Read ALL rows from the step data in their given order (wd:Order sequence).\n"
+        "  For each row, determine the DISPLAY NAME using this priority rule:\n"
+        "    - If wd:Type = 'To Do' AND wd:Specify_Todo wd:Descriptor is non-empty:\n"
+        "        DISPLAY NAME = wd:Specify_Todo wd:Descriptor value\n"
+        "        (use whatever To Do task names appear in YOUR step data)\n"
+        "    - If wd:Type = 'Action' or 'Approval' or 'Service':\n"
+        "        DISPLAY NAME = wd:Triggers wd:Descriptor value\n"
+        "        (use whatever trigger names appear in YOUR step data)\n"
+        "    - For Initiation step: DISPLAY NAME = 'Initiate [BP Name]'\n"
+        "  Also record for each row: Type, Primary Group, Condition\n"
+        "  (conditions are for internal evaluation only — NEVER output raw condition text).\n\n"
+        "STEP 2 — Apply this scenario's conditions:\n"
+        "  For each step that has a wd:If condition:\n"
+        "    - If the condition evaluates TRUE in this scenario → include the step as EXECUTE\n"
+        "    - If the condition evaluates FALSE in this scenario → include the step as SKIP\n"
+        "    - '1=0?' is always FALSE → always SKIP\n"
+        "    - All other conditions → evaluate based on this scenario's test data\n"
+        "  Steps with NO condition → always EXECUTE\n\n"
+
+        "### STEP ORDERING AND COMPLETION STEP RULES:\n\n"
+        "The wd:Order sequence from the step data is the ONLY valid order for listing steps.\n"
+        "List ALL steps strictly in wd:Order sequence regardless of step type.\n"
+        "Do NOT reorder steps based on logic, assumptions, or process knowledge.\n\n"
+        "COMPLETION STEP behaviour:\n"
+        "  - The step marked wd:Completion_Step=1 is where the process officially completes.\n"
+        "  - It must be labelled — COMPLETION STEP in its entry.\n"
+        "  - ALL steps that appear AFTER the completion step in the wd:Order sequence\n"
+        "    are post-completion or parallel background steps.\n"
+        "  - These steps still appear in Column 6 in their exact wd:Order position.\n"
+        "  - Label every post-completion step clearly:\n"
+        "    [N]. [DISPLAY NAME] ([Step Type]) — [Group] must [action] — POST-COMPLETION STEP\n"
+        "  - Post-completion steps are optional or administrative tasks that occur\n"
+        "    after the main process has completed.\n"
+        "  - The final verification step always remains the very last item:\n"
+        "    [N]. Verify process status changes to Complete\n\n"
+
+        "STEP 3 — Write numbered steps in sequence:\n"
+        "  Number every step 1, 2, 3, 4... in the exact wd:Order sequence.\n"
+        "  ALL step descriptions must be in plain, user-friendly business English.\n"
+        "  NEVER include raw Workday condition expressions in any step description.\n\n"
+        "  CRITICAL — EVERY EXECUTE STEP MUST STATE:\n"
+        "    (a) WHO performs the step (the assigned security group)\n"
+        "    (b) WHAT they must do (a plain English action verb phrase describing the task)\n"
+        "  Do NOT simply say 'assigned to [Group]' — always describe the action.\n\n"
+        "  Use this format for each step by type:\n\n"
+        "  INITIATION step:\n"
+        "    1. Initiate [BP Name] — [Security Group] must initiate the [BP Name] process\n\n"
+        "  ACTION step (standard):\n"
+        "    [N]. [Action Name] (Action) — [Security Group] must complete [Action Name] and submit\n\n"
+        "  ACTION step (review type):\n"
+        "    [N]. [Action Name] (Action) — [Security Group] must review the details and submit\n\n"
+        "  TO DO step:\n"
+        "    [N]. [To Do Name] (To Do) — [Security Group] must complete the [To Do Name] task and mark it done\n\n"
+        "  SERVICE step:\n"
+        "    [N]. [Service Name] (Service) — system automatically executes [Service Name]\n\n"
+        "  APPROVAL step:\n"
+        "    [N]. [Approval Name] (Approval) — [Security Group] must review all details and approve,\n"
+        "    or send back if corrections are needed\n\n"
+        "  COMPLETION STEP (append label):\n"
+        "    [N]. [Step Name] ([Step Type]) — [Security Group] must [action] — COMPLETION STEP\n\n"
+        "  POST-COMPLETION STEP (append label):\n"
+        "    [N]. [Step Name] ([Step Type]) — [Security Group] must [action] — POST-COMPLETION STEP\n\n"
+        "  SKIPPED step (condition FALSE):\n"
+        "    [N]. [DISPLAY NAME] ([Step Type]) — SKIPPED — [plain English business reason]\n"
+        "    CRITICAL: The reason MUST be written in plain English.\n"
+        "    NEVER copy raw wd:If condition text into the reason.\n"
+        "    NEVER use expressions containing '?', '=', or system field names.\n"
+        "    For always-FALSE steps (1=0?): write 'not applicable for this scenario'\n"
+        "    For business condition FALSE steps: write the plain English business reason\n"
+        "    derived from understanding what that condition means in context of this BP.\n\n"
+        "STEP 4 — Final verification step:\n"
+        "  Always add as the very last numbered item after all other steps:\n"
+        "  [N]. Verify process status changes to Complete\n\n"
+        "IMPORTANT: There is NO maximum step count limit for Column 6.\n"
+        "Every single step from the step data must appear in the output, either as EXECUTE or SKIP.\n"
+        "This is non-negotiable — partial step lists are INCORRECT.\n\n"
+
+        "## ══════════════════════════════════════════════════════════\n"
+        "## COLUMN 7 (Expected Result) — STEP-BY-STEP RESULTS\n"
+        "## ══════════════════════════════════════════════════════════\n\n"
+        "Column 7 MUST have a corresponding expected result for EVERY step listed in Column 6.\n"
+        "Match each Column 6 step exactly, in the same order.\n"
+        "ALL expected results must be written in plain, user-friendly business English.\n"
+        "NEVER write 'condition not met' as an expected result.\n"
+        "NEVER include raw Workday condition syntax in any expected result.\n\n"
+        "Format for each result by step type:\n\n"
+        "  INITIATION step result:\n"
+        "    1. [BP Name] initiated successfully — [Security Group] has started the process\n\n"
+        "  ACTION step result:\n"
+        "    [N]. [Action Name] completes successfully — [Security Group] submits [plain English outcome]\n\n"
+        "  TO DO step result:\n"
+        "    [N]. [To Do Name] completes successfully — [Security Group] marks the task as done\n\n"
+        "  SERVICE step result:\n"
+        "    [N]. [Service Name] completes — system executes [Service Name] automatically\n\n"
+        "  APPROVAL step result:\n"
+        "    [N]. [Approval Name] approved — [Security Group] reviews and approves successfully\n\n"
+        "  COMPLETION STEP result:\n"
+        "    [N]. [Step Name] completes — [Security Group] approves and process completion is triggered\n\n"
+        "  POST-COMPLETION STEP result:\n"
+        "    [N]. [Step Name] completes — [Security Group] completes the post-process administrative task\n\n"
+        "  SKIPPED step result:\n"
+        "    [N]. [Step Name] is skipped — [plain English reason matching Column 6's reason for this step]\n"
+        "    NEVER write 'condition not met' — always write the specific plain English business reason.\n"
+        "    The reason must match exactly what was written in Column 6 for the same step.\n\n"
+        "  Final verification result (always last):\n"
+        "    [N]. Process status confirmed as Complete — record is active in the system\n\n"
+        "IMPORTANT: There is NO maximum result count limit for Column 7.\n"
+        "Every step in Column 6 must have a matching result in Column 7.\n\n"
+
+        "## ROLE & OBJECTIVE\n"
+        "You are a Workday test case generator.\n"
+        "Your ONLY source of truth is the step data between\n"
+        "--- START OF STEP DATA --- and --- END OF STEP DATA ---\n"
+        "Do NOT invent any step, condition, group, or field name not in the step data.\n"
+        "Do NOT assume this is any specific business process — derive everything from the step data.\n\n"
+
+        "---\n\n"
+        "## PHASE 1 — MANDATORY DATA EXTRACTION\n\n"
+        "### P1-A: LIST ALL STEPS IN ORDER\n"
+        "For each row in step data record in sequence:\n"
+        "  - wd:Order\n"
+        "  - wd:Step wd:Descriptor  (the full step descriptor label)\n"
+        "  - wd:Type wd:Descriptor  (step type: Action / To Do / Approval / Initiation / Service)\n"
+        "  - wd:Triggers wd:Descriptor  (the Workday action trigger name)\n"
+        "  - wd:Specify_Todo wd:Descriptor  *** CRITICAL: this is the human-readable To Do task name ***\n"
+        "    This field is populated ONLY for To Do type steps.\n"
+        "    Use whatever values appear in YOUR step data — do not assume fixed values.\n"
+        "  - wd:If wd:Descriptor  (condition text — for internal evaluation only,\n"
+        "    NEVER output raw condition text into the table)\n"
+        "  - wd:Groups wd:Descriptor  (primary security group)\n"
+        "  - wd:Alternate_Security_Groups_from_Routing_Restrictions wd:Descriptor  (alternate group)\n"
+        "  - wd:Completion_Step  (1 = this step triggers process completion)\n"
+        "  - wd:Due_Date_Is_Based_On_Effective_Date  (1 = due date based on effective date)\n"
+        "  Note: Multiple rows with the same wd:Order are parallel steps at the same stage —\n"
+        "  list them all; each must appear in Column 6.\n\n"
+
+        "### P1-B: INITIATING SECURITY GROUPS\n"
+        "Extract ALL security groups from the wd:Initiating_Security_Groups elements in the XML.\n"
+        "Record every single group descriptor individually as a numbered list.\n"
+        "This list is used ONLY to rotate initiators across scenario rows.\n"
+        "It does NOT control the number of rows generated.\n"
+        "NEVER output this full list in any single table cell.\n\n"
+
+        "### P1-C: LIST EVERY CONDITION\n"
+        "For each non-empty wd:If wd:Descriptor:\n"
+        "  - Assign ID: C1, C2, C3...\n"
+        "  - Record exact condition text verbatim (for internal use only — never paste into output)\n"
+        "  - Classify: ALWAYS-FALSE (1=0?) / ALWAYS-TRUE / BUSINESS-CONDITION\n"
+        "  - For each condition, write a plain English translation that will be used in output columns\n"
+        "  - For BUSINESS-CONDITION: note TRUE-path group and FALSE-path (skipped)\n"
+        "  - Count total BUSINESS-CONDITIONs — label this count as N\n\n"
+
+        "### P1-D: ALTERNATE GROUPS\n"
+        "List all non-empty wd:Alternate_Security_Groups values with their step.\n\n"
+
+        "### P1-E: COMPLETION STEP\n"
+        "Find wd:Completion_Step=1. Record its exact wd:Order position and Step Name.\n"
+        "All steps with wd:Order AFTER the completion step are POST-COMPLETION steps.\n\n"
+
+        "### P1-F: DUE DATE EFFECTIVE STEPS\n"
+        "Find all wd:Due_Date_Is_Based_On_Effective_Date=1 rows.\n\n"
+
+        "### P1-G: SCENARIO DIMENSIONS — BUILD BEFORE PHASE 2\n"
+        "Before building the scenario matrix, identify ALL dimensions that drive scenario variation:\n"
+        "  Dimension A — BUSINESS-CONDITIONs: each condition Cn has a TRUE state and a FALSE state\n"
+        "  Dimension B — Routing: primary group path vs each alternate group path from P1-D\n"
+        "  Dimension C — Completion: Completion_Step=1 path must be explicitly verified\n"
+        "  Dimension D — Approval outcomes: where Approval steps exist, both approve and send-back paths\n"
+        "  Dimension E — ALWAYS-FALSE conditions: group all into one dedicated validation scenario\n"
+        "  Dimension F — MAX-PATH: all BUSINESS-CONDITIONs TRUE simultaneously\n"
+        "  Dimension G — MIN-PATH: all BUSINESS-CONDITIONs FALSE simultaneously\n"
+        "The total number of scenario rows is determined by the maximum meaningful combinations\n"
+        "across ALL of these dimensions — NOT by the number of initiating security groups.\n"
+        "Initiating security groups from P1-B are rotated across scenarios to distribute coverage\n"
+        "but do NOT add extra rows by themselves.\n\n"
+
+        "---\n\n"
+        "## PHASE 2 — SCENARIO MATRIX\n\n"
+        "## SCENARIO ROW COUNT RULE — THIS IS THE PRIMARY RULE\n"
+        "The number of scenario rows is driven ENTIRELY by the maximum meaningful combination\n"
+        "of scenario dimensions identified in P1-G.\n"
+        "Minimum rows = 2 x N (one TRUE + one FALSE per BUSINESS-CONDITION)\n"
+        "              + 1 (MAX-PATH row)\n"
+        "              + 1 (MIN-PATH row)\n"
+        "              + 1 (COMPLETION STEP verification row)\n"
+        "              + number of alternate groups from P1-D (one row each)\n"
+        "              + 1 (ALWAYS-FALSE validation row, only if ALWAYS-FALSE conditions exist)\n"
+        "              + additional rows for any further meaningful combinations not yet covered\n"
+        "where N = number of BUSINESS-CONDITIONs from P1-C.\n"
+        "The number of initiating security groups has NO effect on row count.\n\n"
+
+        "## INITIATOR ROTATION RULE\n"
+        "Initiating security groups from P1-B are assigned to scenario rows using rotation.\n"
+        "Rotate through the P1-B list sequentially — assign one initiator per row.\n"
+        "When the list is exhausted, start again from the beginning of the list.\n"
+        "This ensures initiator variety across the output without inflating row count.\n"
+        "Column 3 for EVERY row must contain EXACTLY ONE security group name — no lists, no exceptions.\n"
+        "The assigned initiator name must exactly match the wd:Descriptor value from P1-B.\n\n"
+
+        "### P2-A: ONE ROW PER BUSINESS-CONDITION STATE\n"
+        "For each BUSINESS-CONDITION Cn from P1-C:\n"
+        "  - ONE row where Cn=TRUE and all other conditions are at their minimum/default state\n"
+        "    Focus: this row tests specifically what happens when Cn is TRUE\n"
+        "  - ONE row where Cn=FALSE and all other conditions are at their minimum/default state\n"
+        "    Focus: this row tests specifically what happens when Cn is FALSE\n"
+        "  Assign initiator by rotation from P1-B list.\n\n"
+
+        "### P2-B: COMBINATION ROWS\n"
+        "  MAX-PATH row: all BUSINESS-CONDITIONs TRUE simultaneously\n"
+        "    Focus: every conditional step executes — maximum process coverage\n"
+        "    Assign initiator by rotation from P1-B list.\n\n"
+        "  MIN-PATH row: all BUSINESS-CONDITIONs FALSE simultaneously\n"
+        "    Focus: every conditional step is skipped — minimum process path\n"
+        "    Assign initiator by rotation from P1-B list.\n\n"
+
+        "### P2-C: ALTERNATE GROUP ROUTING ROWS\n"
+        "For each alternate group from P1-D:\n"
+        "  ONE row routing through that alternate group path.\n"
+        "  Column 3: '[Initiator from P1-B rotation] (Alternate: [Alternate Group Name])'\n\n"
+
+        "### P2-D: COMPLETION STEP VERIFICATION ROW\n"
+        "ONE row explicitly designed to reach and verify the Completion_Step=1 step.\n"
+        "This row must set all conditions so the completion step is reached and executed.\n"
+        "Assign initiator by rotation from P1-B list.\n\n"
+
+        "### P2-E: ALWAYS-FALSE VALIDATION ROW\n"
+        "If any ALWAYS-FALSE conditions exist (from P1-C):\n"
+        "  ONE dedicated row that validates every ALWAYS-FALSE condition step is permanently skipped.\n"
+        "  Column 5 must name every ALWAYS-FALSE step in plain English and confirm it never executes.\n"
+        "  Assign initiator by rotation from P1-B list.\n"
+        "If no ALWAYS-FALSE conditions exist, skip this row entirely.\n\n"
+
+        "### P2-F: APPROVAL OUTCOME ROWS\n"
+        "If any Approval type steps exist in the process:\n"
+        "  ONE row where the approval is granted — process continues forward\n"
+        "  ONE row where the approval is sent back — process returns for correction\n"
+        "  Assign initiators by rotation from P1-B list.\n"
+        "If no Approval steps exist, skip these rows entirely.\n\n"
+
+        "### P2-G: ADDITIONAL MEANINGFUL COMBINATION ROWS\n"
+        "After all mandatory rows above are generated, identify any remaining meaningful\n"
+        "combinations of conditions, routing paths, or step types not yet covered.\n"
+        "Generate one additional row per unique meaningful combination found.\n"
+        "Each additional row must be demonstrably different from every existing row.\n"
+        "Assign initiators by continuing the rotation from P1-B list.\n\n"
+
+        "### P2-H: UNIQUENESS CHECK\n"
+        "Before finalising the scenario matrix, verify:\n"
+        "  - No two rows have the same combination of condition states AND routing path\n"
+        "  - Every row has a clearly different primary focus from every other row\n"
+        "  - Remove or merge any duplicate scenarios found\n\n"
+
+        "---\n\n"
+        "## PHASE 3 — TEST DATA FIELDS\n"
+        "Derive ALL field names from the step data only — do not assume fields from any specific BP.\n"
+        "Format: comma-separated field names in plain English.\n"
+        "Condition-driving fields: append [drives: plain English description of what this field controls].\n"
+        "NO sample values. SHORT plain English field names only.\n"
+        "NEVER use raw Workday condition syntax in test data field descriptions.\n\n"
+
+        "---\n\n"
+        "## PHASE 4 — WRITE THE TABLE\n\n"
+        "### Column 1: Test Case ID\n"
+        "[Acronym][4-digit zero-padded serial] — acronym from INFERRED BP name initials.\n\n"
+
+        "### Column 2: Test Scenario — MAX 25 WORDS\n"
+        "\"[Initiator] initiates [BP name] — [THIS row's condition focus in plain English] — [outcome].\"\n"
+        "No raw Workday condition syntax. Plain business English only.\n\n"
+
+        "### Column 3: Security Role — ONE SINGLE GROUP PER ROW — NON-NEGOTIABLE\n"
+        "EVERY row without exception must contain ONLY ONE security group name.\n"
+        "This is the initiator assigned to this row by the P1-B rotation.\n"
+        "The name must exactly match the wd:Descriptor from wd:Initiating_Security_Groups in P1-B.\n"
+        "FORBIDDEN in Column 3:\n"
+        "  - Lists of multiple groups separated by commas\n"
+        "  - The phrase 'All initiators' or any similar collective label\n"
+        "  - Any group name not present in the step data\n"
+        "  - Blank cells\n"
+        "For alternate group routing rows only:\n"
+        "  '[Single Initiator Name] (Alternate: [Alternate Group Name])'\n\n"
+
+        "### Column 4: Test Data / Inputs\n"
+        "Short plain English field names derived from step data only.\n"
+        "Note condition drivers in plain English — no raw Workday condition expressions.\n\n"
+
+        "### Column 5: Test Case Description — MAX 3 SENTENCES\n"
+        "Focus on what is UNIQUE about this scenario's conditional path.\n"
+        "Plain business English only — no raw condition syntax, no Workday field names.\n\n"
+
+        "### Column 6: Test Steps — FULL ORDERED STEP TRACE (no step limit)\n"
+        "Follow ALL STEP TRACE RULES above exactly.\n"
+        "Steps listed in strict wd:Order sequence — no reordering.\n"
+        "Every EXECUTE step states WHO performs it and WHAT they must do.\n"
+        "Steps after the COMPLETION STEP are labelled POST-COMPLETION STEP.\n"
+        "SKIPPED steps use plain English reason — NEVER raw condition text.\n"
+        "Final item is always: [N]. Verify process status changes to Complete\n\n"
+
+        "### Column 7: Expected Result — MATCHING RESULT PER STEP (no result limit)\n"
+        "Follow STEP-BY-STEP RESULTS RULES above exactly.\n"
+        "Every step in Column 6 must have a corresponding result in Column 7 in the same order.\n"
+        "Every result states who acted and what was achieved in plain English.\n"
+        "NEVER write 'condition not met' — always write a plain English business reason.\n"
+        "Post-completion step results are labelled accordingly.\n\n"
+
+        "---\n\n"
+        "## FINAL SELF-CHECK\n"
+        "Before outputting the table, verify every row passes ALL of these checks:\n\n"
+        "  OUTPUT FORMAT:\n"
+        "  - INFERRED_BP is the very first line\n"
+        "  - Table starts immediately after INFERRED_BP line\n"
+        "  - Every row has exactly 7 pipe-delimited columns\n"
+        "  - No cell is blank\n\n"
+
+        "  ROW COUNT VERIFICATION:\n"
+        "  - Total rows = (2 x N) + 1 MAX-PATH + 1 MIN-PATH + 1 COMPLETION\n"
+        "                + number of alternate groups + ALWAYS-FALSE row (if applicable)\n"
+        "                + APPROVAL rows (if applicable) + any additional combination rows\n"
+        "  - Row count is NOT based on number of initiating security groups\n"
+        "  - Every row is driven by a unique scenario combination from P1-G dimensions\n\n"
+
+        "  INITIATOR ROTATION VERIFICATION:\n"
+        "  - Initiators from P1-B are rotated sequentially across all rows\n"
+        "  - Column 3 of EVERY row contains exactly ONE security group name\n"
+        "  - No row has a list of groups or any collective label in Column 3\n"
+        "  - The group name in Column 3 exactly matches the wd:Descriptor from the step data\n\n"
+
+        "  SCENARIO COVERAGE:\n"
+        "  - Every BUSINESS-CONDITION has at least one TRUE row and one FALSE row\n"
+        "  - MIN-PATH row exists (all business conditions FALSE)\n"
+        "  - MAX-PATH row exists (all business conditions TRUE)\n"
+        "  - COMPLETION STEP row exists (explicitly tests Completion_Step=1)\n"
+        "  - ALWAYS-FALSE validation row exists if ALWAYS-FALSE conditions were found\n"
+        "  - APPROVAL rows exist if Approval steps were found\n"
+        "  - Each row is meaningfully different from every other row\n\n"
+
+        "  COLUMN 2:\n"
+        "  - MAX 25 words per row\n"
+        "  - Plain English only — no raw condition syntax\n\n"
+
+        "  COLUMN 3:\n"
+        "  - Contains exactly ONE security group name per row — no exceptions\n"
+        "  - Name matches exactly the wd:Descriptor from the step data\n"
+        "  - No commas separating multiple group names\n"
+        "  - No collective labels like 'All initiators'\n\n"
+
+        "  COLUMN 4:\n"
+        "  - Plain English field names only\n"
+        "  - No raw Workday condition expressions\n\n"
+
+        "  COLUMN 5:\n"
+        "  - MAX 3 sentences per row\n"
+        "  - Plain English only\n\n"
+
+        "  COLUMN 6:\n"
+        "  - Every step from step data appears in strict wd:Order sequence\n"
+        "  - Every EXECUTE step states WHO performs it and WHAT they must do\n"
+        "  - No step simply says 'assigned to [Group]' without describing the action\n"
+        "  - Steps after the COMPLETION STEP are labelled POST-COMPLETION STEP\n"
+        "  - SKIPPED steps have plain English reasons — zero raw condition expressions\n"
+        "  - Final item is: [N]. Verify process status changes to Complete\n\n"
+
+        "  COLUMN 7:\n"
+        "  - Every step in Column 6 has exactly one matching result in Column 7\n"
+        "  - Every result states who acted and what was achieved\n"
+        "  - NEVER uses 'condition not met'\n"
+        "  - Post-completion step results are labelled accordingly\n"
+        "  - Final result matches the final verification step\n\n"
+
+        "  PLAIN ENGLISH:\n"
+        "  - NO column contains raw Workday syntax such as '1=0?' or any verbatim wd:If text\n"
+        "  - '" + chunk_id + "' does NOT appear anywhere in the table\n\n"
+
+        "## REQUIRED TABLE HEADER\n"
+        "| Test Case ID | Test Scenario | Security Role | Test Data / Inputs | Test Case Description | Test Steps | Expected Result |\n\n"
+        "---\n\n"
+        "## STEP DETAILS — YOUR ONLY SOURCE OF TRUTH\n\n"
+        "--- START OF STEP DATA ---\n"
+        + step_details_text +
+        "\n--- END OF STEP DATA ---\n"
+    )

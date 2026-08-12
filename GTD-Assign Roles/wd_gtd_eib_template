@@ -1,0 +1,119 @@
+import typing
+import core
+import re
+import io
+import pandas
+import openpyxl
+
+def wd_gtd_eib_template(markdown_table: typing.Annotated[str, "markdown content for file"] = None, 
+    fileName: typing.Annotated[str, "name of the template uploaded"] = None, 
+    patternType: typing.Annotated[str, "TDW pattern type e.g. TDW1, TDW2 etc."] = None):
+
+    # ✅ Map patternType to output filename
+    OUTPUT_FILE_MAP = {
+    "TDW1": "Job_Requisition",
+    "TDW2": "Assign_Roles",
+    "TDW3": "Job_Posting",
+    "TDW4": "Position_Data",
+    "TDW5": "Candidate_Data",
+    "TDW6": "Hire_Data"
+}
+
+
+    try:
+        header_row = 5  # Row 5 = 'Fields' row (1-indexed)
+        import openpyxl
+
+        md_df = parse_markdown(markdown_table)
+        md_columns = md_df.columns.tolist()
+
+        filefromartifacts = core.get_artifact(f"uploaded_artifacts/{fileName}", text=False)
+        file_buffer = io.BytesIO(filefromartifacts)
+        wb = openpyxl.load_workbook(file_buffer)
+
+        for sheet_name in wb.sheetnames:
+            # Skip Overview sheet — contains metadata only
+            if sheet_name.lower() == "overview":
+                continue
+
+            ws = wb[sheet_name]
+            print(f"Processing sheet: {sheet_name}")
+
+            # ✅ Read headers from Column B (index 2) onwards
+            # Column A always contains metadata labels ('Fields', 'Format' etc.)
+            excel_headers = [
+                ws.cell(row=header_row, column=i).value
+                for i in range(2, ws.max_column + 1)
+            ]
+            excel_headers = [h if h else "" for h in excel_headers]
+
+            # Column mapping between markdown and excel headers
+            mapping = match_columns(excel_headers, md_columns)
+
+            if not any(mapping.values()):
+                print(f"❌ No matching columns for sheet {sheet_name}")
+                continue
+
+            print(f"✔ Matched columns in {sheet_name}:")
+            for k, v in mapping.items():
+                if v:
+                    print(f"  {k} → {v}")
+
+            # ✅ Start writing data at row 6 (right after Fields row 5)
+            # col_offset = 2 to account for Column A metadata label
+            start_row = header_row + 1
+            col_offset = 2
+
+            for row_offset, (_, md_row) in enumerate(md_df.iterrows()):
+                excel_row = start_row + row_offset
+
+                for md_col in md_columns:
+                    excel_col_name = mapping.get(md_col)
+
+                    if excel_col_name:
+                        # ✅ +col_offset accounts for Column A being metadata
+                        excel_col_index = excel_headers.index(excel_col_name) + col_offset
+                        ws.cell(row=excel_row, column=excel_col_index).value = md_row[md_col]
+
+        # ✅ Auto-determine output filename based on patternType
+        # Falls back to 'EIB_Output' if patternType is unknown or not provided
+        output_name = OUTPUT_FILE_MAP.get(patternType, "EIB_Output")
+        output_file = f"{output_name}.xlsx"
+
+        new_file_buffer = io.BytesIO()
+        wb.save(new_file_buffer)
+        new_file_buffer.seek(0)
+        filebytes = new_file_buffer.getvalue()
+        core.write_artifact(f"artifacts/{output_file}", filebytes)
+        print("\n✅ Excel updated successfully!")
+        print(f"📁 Output file saved as: {output_file}")
+        return {core.generate_presigned_url(output_file)}
+        presigned_url = core.generate_presigned_url(f"artifacts/{output_file}")
+        return presigned_url
+    except Exception as e:
+        return f"Error Creating Excel file: {e}"
+
+
+def parse_markdown(md):
+    import pandas as pd
+    from io import StringIO
+    """Parse markdown table into DataFrame."""
+    df = pd.read_csv(StringIO(md), sep="|", engine="python", skipinitialspace=True)
+    df = df.dropna(axis=1, how="all")
+    df.columns = [c.strip() for c in df.columns]
+    df = df[~df.apply(lambda row: row.astype(str).str.contains("---").any(), axis=1)]
+    df = df.replace("", pd.NA).dropna(how="all")
+    return df
+
+
+def normalize(col):
+    return re.sub(r"[^a-z0-9]", "", col.lower()) if isinstance(col, str) else ""
+
+
+def match_columns(excel_cols, md_cols):
+    """Map md_column → excel_column (case-insensitive)."""
+    excel_norm_map = {normalize(c): c for c in excel_cols}
+    mapping = {}
+    for md in md_cols:
+        mapping[md] = excel_norm_map.get(normalize(md))
+    return mapping

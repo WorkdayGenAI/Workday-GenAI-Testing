@@ -1,0 +1,444 @@
+import typing
+import core
+import json
+import re
+import requests
+import io
+import copy
+import datetime
+import pandas
+
+def wdquasar_reposcenarios_fin(payload: typing.Annotated[str, "Base payload for Quasar API"] = None, 
+    BusinessProcessName: typing.Annotated[str, "JSON array string of Business Processes"] = None, 
+    conversationid: typing.Annotated[str, "Unique conversation ID"] = None, 
+    fileinitialname: typing.Annotated[str, "Initial base name of the file"] = None):
+
+
+    if not BusinessProcessName:
+        return {"error": "BusinessProcessName is required"}
+
+    bp_list = _parse_bp_input(BusinessProcessName)
+    businessprocess_list = list({
+        bp.strip() for bp in bp_list if isinstance(bp, str) and bp.strip()
+    })
+    if not businessprocess_list:
+        return {"error": "No valid Business Processes found"}
+
+    if not payload:
+        return {"error": "payload is required"}
+    try:
+        base_payload = json.loads(payload)
+    except json.JSONDecodeError:
+        return {"error": "Invalid JSON payload"}
+
+    session = requests.Session()
+
+    # ── Quasar auth ──────────────────────────────────────────────────────────
+    try:
+        credentials   = core.get_secret("wd-tool-secrets")
+        quasarbaseurl = credentials.get("quasar_baseurl")
+        token_response = session.post(
+            quasarbaseurl + "/atr-gateway/identity-management/api/v1/auth/short-token?useDeflate=true",
+            headers={"Content-Type": "application/json"},
+            json={
+                "username": credentials.get("quasar_username"),
+                "password": credentials.get("quasar_password")
+            },
+            timeout=30
+        )
+        token_response.raise_for_status()
+        token = token_response.json().get("token")
+        if not token:
+            return {"error": "Failed to generate Quasar token"}
+    except Exception as e:
+        return {"error": "Quasar token generation failed: " + str(e)}
+
+    quasar_headers = {
+        "accept":       "application/json",
+        "content-type": "application/json",
+        "apiToken":     token
+    }
+    search_url = quasarbaseurl + "/api/v2/acnopenai/searchvectors"
+
+    
+
+    # ── Quasar vector search ─────────────────────────────────────────────────
+
+
+    all_results = []
+    for bp in businessprocess_list:
+        try:
+            dynamic_payload                 = dict(base_payload)
+            # Updated query, index, and search_limit from payload
+            dynamic_payload["query"]        = (
+                "@content:Scenario Name*" + bp + "* "
+                "AND @metadata:" + QUASAR_METADATA
+            )
+            dynamic_payload["index"]        = QUASAR_INDEX
+            dynamic_payload["search_limit"] = QUASAR_SEARCH_LIMIT
+
+            response = session.post(
+                search_url, headers=quasar_headers,
+                json=dynamic_payload, timeout=60
+            )
+            if response.status_code == 200:
+                all_results.append({
+                    "businessprocess": bp,
+                    "status_code":     200,
+                    "response":        response.json()
+                })
+            else:
+                all_results.append({
+                    "businessprocess": bp,
+                    "status_code":     response.status_code,
+                    "error":           response.text
+                })
+        except Exception as e:
+            all_results.append({"businessprocess": bp, "error": str(e)})
+
+    # ── Filter scenarios per BP ───────────────────────────────────────────────
+    filtered_by_bp = {}
+    for result in all_results:
+        bp_name       = result.get("businessprocess", "")
+        response_data = result.get("response", [])
+
+        if isinstance(response_data, dict):
+            response_items = response_data.get("items", [])
+        elif isinstance(response_data, list):
+            response_items = response_data
+        else:
+            response_items = []
+
+        matched_scenarios = []
+        for scenario_item in response_items:
+            if isinstance(scenario_item, dict):
+                scenario = scenario_item
+            elif isinstance(scenario_item, str):
+                scenario = _parse_scenario_string(scenario_item)
+            else:
+                continue
+
+            # Updated field names to match payload output fields
+            business_process = scenario.get("Business Process", "")
+            bp_task_report   = scenario.get("BP/Task/Report", "")
+            scenario_name    = scenario.get("Scenario Name", "")
+
+            if (bp_name.lower() in business_process.lower() or
+                    bp_name.lower() in bp_task_report.lower() or
+                    bp_name.lower() in scenario_name.lower()):
+                matched_scenarios.append(scenario)
+
+        filtered_by_bp[bp_name] = matched_scenarios
+
+    # ── Claude credentials ────────────────────────────────────────────────────
+    try:
+        claude_creds = core.get_secret("SCA_WA_Claude_Opus_4_6")
+    except Exception as e:
+        return {"error": "Failed to retrieve Claude credentials: " + str(e)}
+
+    # ── Parallel Claude calls ─────────────────────────────────────────────────
+    CHUNK_SIZE  = 40
+    MAX_WORKERS = 8
+
+    tasks        = []
+    bp_chunk_map = {}
+    processing_summary = []
+
+    for bp_name, scenarios in filtered_by_bp.items():
+        if not scenarios:
+            processing_summary.append({
+                "bp_name":         bp_name,
+                "status":          "No matching scenarios after filter",
+                "scenarios_found": 0
+            })
+            continue
+
+        chunks = [scenarios[i:i + CHUNK_SIZE] for i in range(0, len(scenarios), CHUNK_SIZE)]
+        bp_chunk_map[bp_name] = {
+            "scenarios": scenarios,
+            "chunks":    chunks,
+            "results":   [None] * len(chunks),
+            "errors":    []
+        }
+        for chunk_idx, chunk in enumerate(chunks):
+            tasks.append((bp_name, chunk_idx, chunk))
+
+    def _process_chunk(args):
+        bp_name, chunk_idx, chunk = args
+        start_idx     = chunk_idx * CHUNK_SIZE + 1
+        scenario_text = _build_scenario_text(chunk, start_idx)
+        thread_session = requests.Session()
+        try:
+            markdown_output = _call_claude(
+                thread_session, claude_creds, bp_name, scenario_text
+            )
+            if not markdown_output:
+                return (
+                    bp_name, chunk_idx, None,
+                    "Chunk " + str(chunk_idx + 1) + ": Claude returned empty response"
+                )
+            df = _parse_markdown_to_df(markdown_output)
+            if df is None:
+                return (
+                    bp_name, chunk_idx, None,
+                    "Chunk " + str(chunk_idx + 1) + ": No valid Markdown table in response"
+                )
+            return bp_name, chunk_idx, df, None
+        except Exception as e:
+            return (
+                bp_name, chunk_idx, None,
+                "Chunk " + str(chunk_idx + 1) + ": " + str(e)
+            )
+
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(_process_chunk, task): task for task in tasks}
+        for future in concurrent.futures.as_completed(futures):
+            bp_name, chunk_idx, df, error = future.result()
+            if error:
+                bp_chunk_map[bp_name]["errors"].append(error)
+            else:
+                bp_chunk_map[bp_name]["results"][chunk_idx] = df
+
+    # ── Assemble per-BP dataframes ────────────────────────────────────────────
+    combined_df_list = []
+    for bp_name, meta in bp_chunk_map.items():
+        bp_df_list   = [df for df in meta["results"] if df is not None]
+        chunk_errors = meta["errors"]
+        scenarios    = meta["scenarios"]
+        chunks       = meta["chunks"]
+
+        if not bp_df_list:
+            processing_summary.append({
+                "bp_name":         bp_name,
+                "status":          "All chunks failed",
+                "scenarios_found": len(scenarios),
+                "chunk_errors":    chunk_errors
+            })
+            continue
+
+        bp_combined_df = pandas.concat(bp_df_list, ignore_index=True)
+        bp_combined_df.insert(0, "Business Process Name", bp_name)
+        combined_df_list.append(bp_combined_df)
+
+        processing_summary.append({
+            "bp_name":              bp_name,
+            "status":               "Success" if not chunk_errors else "Partial Success",
+            "scenarios_found":      len(scenarios),
+            "chunks_total":         len(chunks),
+            "chunks_succeeded":     len(bp_df_list),
+            "test_cases_generated": len(bp_combined_df),
+            "chunk_errors":         chunk_errors if chunk_errors else []
+        })
+
+    # ── Final output ──────────────────────────────────────────────────────────
+    if not combined_df_list:
+        return {
+            "error":   "No Business Processes successfully generated test cases",
+            "summary": processing_summary
+        }
+
+    final_df            = pandas.concat(combined_df_list, ignore_index=True)
+    safe_filename       = re.sub(r'[^A-Za-z0-9_\-]', '_', fileinitialname or "output")
+    safe_conversationid = re.sub(r'[^A-Za-z0-9_\-]', '_', conversationid or "")
+    timestamp_str       = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    final_file_name     = safe_filename + "_" + timestamp_str + "_" + safe_conversationid + ".csv"
+
+    csv_buffer = io.BytesIO()
+    final_df.to_csv(csv_buffer, index=False, encoding="utf-8")
+    csv_buffer.seek(0)
+    core.write_artifact("artifacts/" + final_file_name, csv_buffer.read())
+    download_url = core.generate_presigned_url(final_file_name)
+
+    return {
+        "file_name":           final_file_name,
+        "total_bps_processed": len(businessprocess_list),
+        "successful_bps":      len(combined_df_list),
+        "download_url":        download_url,
+        "summary":             processing_summary
+    }
+
+
+# =====================================================
+# CLAUDE CALL  — prompt updated for Finance payload fields
+# =====================================================
+def _call_claude(session, claude_creds, bp_name, scenario_text):
+    base_url = claude_creds.get("Endpoint", "").rstrip("/") + "/anthropic/v1/messages"
+    api_key  = claude_creds.get("api_key")
+    model    = claude_creds.get("deployment_name")
+
+    headers = {
+        "x-api-key":         api_key,
+        "Content-Type":      "application/json",
+        "anthropic-version": "2023-06-01"
+    }
+
+    claude_prompt = (
+        "##Goal: Generate Workday Test Cases in Markdown table format.\n\n"
+        "##Instructions:\n"
+        "Do not include any additional commentary, special characters, or formatting beyond what is specified in the output format.\n\n"
+        "##Rules:\n"
+        "Use the following fields from the SCENARIO INPUT as the basis for test case creation:\n"
+        "- Scenario Name\n"
+        "- Business Process\n"
+        "- BP/Task/Report\n"
+        "- Workstream\n"
+        "- Test Scenario Description\n"
+        "- Expected Result\n"
+        "- Initiator\n\n"
+        "Each test case should reflect the logic, conditions, roles, and validations defined in these fields.\n\n"
+        "- 'Scenario ID' should be the value of Scenario ID from the scenario input.\n"
+        "- 'Test Scenario' should be the Test Scenario Description from the scenario input.\n\n"
+        "##Test Data / Inputs:\n"
+        "Review the scenario details and identify the data required to execute the test case "
+        "(e.g., Employee Name, Position, Location, Effective Date, Cost Center, Ledger Account).\n\n"
+        "##Test Case Description:\n"
+        "Provide a concise summary relevant to the overall scenario described in the test case.\n\n"
+        "##Test Steps:\n"
+        "Provide detailed, step-by-step instructions from initiation to completion in a single paragraph format. "
+        "Each step must be explicitly numbered (1, 2, 3, etc.). "
+        "All steps must be written continuously in one paragraph, separated by full stop.\n\n"
+        "##Expected Result:\n"
+        "Clearly state the expected outcome for each numbered step. "
+        "Written continuously in a single paragraph, separated by full stop.\n\n"
+        "##Security Role:\n"
+        "Derive the Security Role from the 'Initiator' field of each scenario.\n\n"
+        "##Output columns (Markdown table, no extra text outside the table):\n"
+        "| Test Scenario | Security Role | Test Data/Inputs | Scenario ID | Test Scenario Description | Test Steps | Expected Result |\n\n"
+        "SCENARIO INPUT for Business Process: " + bp_name + "\n" + scenario_text
+    )
+
+    messages  = [{"role": "user", "content": claude_prompt}]
+    full_text = ""
+
+    while True:
+        claude_payload = {
+            "model":       model,
+            "max_tokens":  16000,
+            "temperature": 0.2,
+            "messages":    messages
+        }
+        response = session.post(
+            base_url, headers=headers, json=claude_payload, timeout=(10, 300)
+        )
+        response.raise_for_status()
+        data  = response.json()
+        chunk = "".join(
+            [item.get("text", "") for item in data.get("content", [])]
+        ).strip()
+        full_text += chunk
+
+        if data.get("stop_reason") != "max_tokens":
+            break
+
+        messages.append({"role": "assistant", "content": chunk})
+        messages.append({
+            "role":    "user",
+            "content": "Continue from exactly where you stopped. Do not repeat content."
+        })
+
+    return full_text
+
+
+# =====================================================
+# MARKDOWN → DATAFRAME
+# =====================================================
+def _parse_markdown_to_df(markdown_output):
+    lines       = [line.strip() for line in markdown_output.splitlines() if line.strip()]
+    table_lines = [line for line in lines if line.startswith("|")]
+
+    if len(table_lines) < 2:
+        return None
+
+    cleaned_lines = [
+        line for line in table_lines
+        if not re.match(r'^\|\s*[-:]+[\s|:|-]*$', line)
+    ]
+
+    csv_text = "\n".join([line.strip("|") for line in cleaned_lines])
+
+    try:
+        df         = pandas.read_csv(io.StringIO(csv_text), sep="|", engine="python")
+        df.columns = [col.strip() for col in df.columns]
+        df         = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+        return df
+    except Exception:
+        return None
+
+
+# =====================================================
+# HELPER FUNCTIONS
+# =====================================================
+def _parse_bp_input(raw_input):
+    try:
+        parsed = json.loads(raw_input)
+    except Exception:
+        parsed = raw_input
+
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict) and "BusinessProcessName" in parsed:
+        return parsed.get("BusinessProcessName", [])
+    if isinstance(parsed, str):
+        try:
+            inner = json.loads(parsed)
+            if isinstance(inner, list):
+                return inner
+        except Exception:
+            pass
+        if "," in parsed:
+            return [x.strip() for x in parsed.split(",")]
+        return [parsed.strip()]
+    return []
+
+
+def _parse_scenario_string(scenario_str):
+    # Updated known_keys to match payload output fields
+    known_keys = [
+        "BP/Task/Report", "Workstream", "Business Process",
+        "Scenario ID", "Scenario Name",
+        "Test Scenario Description", "Expected Result", "Initiator"
+    ]
+    key_positions = []
+    for key in known_keys:
+        pattern = re.compile(
+            r'(?:^|,\s*)' + re.escape(key) + r'\s*:\s*', re.IGNORECASE
+        )
+        match = pattern.search(scenario_str)
+        if match:
+            key_positions.append((match.start(), match.end(), key))
+
+    key_positions.sort(key=lambda x: x[0])
+    scenario = {}
+    for i, (start, value_start, key) in enumerate(key_positions):
+        value_end = (
+            key_positions[i + 1][0] if i + 1 < len(key_positions)
+            else len(scenario_str)
+        )
+        value         = scenario_str[value_start:value_end].strip().rstrip(",").strip()
+        scenario[key] = value
+    return scenario
+
+
+def _build_scenario_text(scenarios_slice, start_idx):
+    text = ""
+    for idx, s in enumerate(scenarios_slice, start=start_idx):
+        text += (
+            "\nScenario " + str(idx) + ":\n"
+            "  Scenario ID: "               + str(s.get("Scenario ID", ""))               + "\n"
+            "  Scenario Name: "             + str(s.get("Scenario Name", ""))             + "\n"
+            "  Business Process: "          + str(s.get("Business Process", ""))          + "\n"
+            "  BP/Task/Report: "            + str(s.get("BP/Task/Report", ""))            + "\n"
+            "  Workstream: "                + str(s.get("Workstream", ""))                + "\n"
+            "  Test Scenario Description: " + str(s.get("Test Scenario Description", "")) + "\n"
+            "  Expected Result: "           + str(s.get("Expected Result", ""))           + "\n"
+            "  Initiator: "                 + str(s.get("Initiator", ""))                 + "\n"
+        )
+    return text
+
+ # =====================================================
+# PAYLOAD CONSTANTS  (from provided payload)
+# =====================================================
+QUASAR_INDEX        = "wd_TSEndtoEndTesting_Finance_idx"
+QUASAR_METADATA     = "Vectorization_Repository___30th_Oct_2025.xlsx"
+QUASAR_SEARCH_LIMIT = "200"   

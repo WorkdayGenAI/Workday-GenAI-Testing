@@ -1,0 +1,212 @@
+import typing
+import json
+import core
+import re
+import io
+import pandas
+import requests
+import datetime
+
+def wd_bp_quasar_to_workday_csv_us(fileinitialname: typing.Annotated[str, "Initial base name of the file"] = None, 
+    conversationid: typing.Annotated[str, "Conversation identifier"] = None, 
+    BusinessProcessName: typing.Annotated[str, "name of the business process"] = None, 
+    payload: typing.Annotated[str, "Base payload for Quasar API"] = None):
+  
+    
+    """
+    Generates test cases from uploaded file content using Claude AI.
+    Output: CSV with Business Process Name, Test Scenario, Security Role, Test Data/Inputs, Test Steps, Expected Result.
+    """
+    
+    if not payload:
+        return {"error": "payload (file content) is required"}
+
+    try:
+        claude_creds = core.get_secret("SCA_WA_Claude_Opus_4_6")
+    except Exception as e:
+        return {"error": "Failed to retrieve Claude credentials: " + str(e)}
+
+    base_url = claude_creds.get("Endpoint", "").rstrip("/") + "/anthropic/v1/messages"
+    api_key  = claude_creds.get("api_key")
+    model    = claude_creds.get("deployment_name")   
+
+    headers = {
+        "x-api-key":         api_key,
+        "Content-Type":      "application/json",
+        "anthropic-version": "2023-06-01"
+    } 
+
+    # Prepare the Claude prompt with the provided rules and format
+    claude_prompt = f"""Generate new, original Workday test cases in Markdown table format based on the provided user story input. Do not retrieve or copy existing scenarios from any repository—create fresh test cases using your knowledge.
+
+Business Process Name: {BusinessProcessName}
+
+Input: {payload}
+
+Output a Markdown table with these columns:
+| Business Process Name | Scenario ID | Test Scenario | Security Role | Test Data/Inputs | Scenario Description | Test Steps | Expected Result |
+
+Here each record is a one set of Test Scenario's fieldnames and corresponding values. Make sure to repeat the above structure for all the Test Scenarios.
+
+**Rules:**
+- Use the Business Process Name provided.
+- Scenario ID should be a unique identifier starting with US followed by a 4-digit number (e.g., US0001, US0002)
+- Create original Test Scenario names and descriptions derived from the input.
+- Derive Security Role from the initiator/persona in the input.
+- Identify Test Data/Inputs required (e.g., names, dates).
+- Provide Test Steps as a numbered list in one paragraph.
+- State Expected Result for each step in one paragraph.
+
+**Instructions:**
+
+1. Generate all possible test scenarios for Description and Acceptance Criteria provided in the input.
+2. Make sure to provide all the values relevant to the field names.
+3. Do not provide any additional information before and after the data.
+4. Strictly do not generate duplicate test scenarios or overly similar content summaries in output.
+
+"""
+    
+    messages  = [{"role": "user", "content": claude_prompt}]
+    full_text = ""
+
+    claude_payload = {
+        "model": model,
+        "max_tokens": 16000,
+        "temperature": 0.2,
+        "messages": messages
+    }
+
+    try:
+        response = requests.post(base_url,
+            headers=headers,
+            json=claude_payload,
+            timeout=(10, 300)
+        )
+        response.raise_for_status()
+        try:
+            data = response.json()
+        except json.JSONDecodeError:
+            return {"error": f"Claude API returned invalid JSON. Status: {response.status_code}, Content: {response.text}"}
+
+        if "content" in data:
+            claude_output = "".join([item.get("text", "") for item in data["content"]]).strip()
+        else:
+            claude_output = data.get("completion", "").strip()
+    except Exception as e:
+        return {"error": "Claude API call failed: " + str(e)}
+
+    # Parse Claude output (Markdown table)
+    df = _parse_markdown_to_df(claude_output)
+    if df is None:
+        return {"error": "No valid Markdown table in Claude response"}
+
+    required_columns = ["Business Process Name", "Test Scenario", "Security Role", "Test Data/Inputs", "Test Steps", "Expected Result"]
+    if not all(col in df.columns for col in required_columns):
+        return {"error": "Claude output missing required columns"}
+
+    # Generate CSV
+    safe_filename = re.sub(r'[^A-Za-z0-9_\-]', '_', fileinitialname or "testcases")
+    safe_conversationid = re.sub(r'[^A-Za-z0-9_\-]', '_', conversationid or "")
+    timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    final_file_name = safe_filename + "_" + timestamp_str + "_" + safe_conversationid + ".csv"
+
+    csv_buffer = io.BytesIO()
+    df.to_csv(csv_buffer, index=False, encoding="utf-8")
+    csv_buffer.seek(0)
+
+    core.write_artifact("artifacts/" + final_file_name, csv_buffer.read())
+    download_url = core.generate_presigned_url(final_file_name)
+
+    return {
+        "file_name": final_file_name,
+        "download_url": download_url
+    }
+
+
+
+# =====================================================
+# HELPER FUNCTIONS
+# =====================================================
+
+def _parse_bp_input(raw_input):
+    try:
+        parsed = json.loads(raw_input)
+    except Exception:
+        parsed = raw_input
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict) and "BusinessProcessName" in parsed:
+        return parsed.get("BusinessProcessName", [])
+    if isinstance(parsed, str):
+        try:
+            inner = json.loads(parsed)
+            if isinstance(inner, list):
+                return inner
+        except Exception:
+            pass
+        if "," in parsed:
+            return [x.strip() for x in parsed.split(",")]
+        return [parsed.strip()]
+    return []
+
+
+def _parse_scenario_string(scenario_str):
+    known_keys = [
+        "Workstream", "Workday BP", "Scenario ID", "Scenario Name",
+        "Test Scenario Description", "Expected Result", "Initiator"
+    ]
+    key_positions = []
+    for key in known_keys:
+        pattern = re.compile(r'(?:^|,\s*)' + re.escape(key) + r'\s*:\s*', re.IGNORECASE)
+        match = pattern.search(scenario_str)
+        if match:
+            key_positions.append((match.start(), match.end(), key))
+
+    key_positions.sort(key=lambda x: x[0])
+
+    scenario = {}
+    for i, (start, value_start, key) in enumerate(key_positions):
+        value_end = key_positions[i + 1][0] if i + 1 < len(key_positions) else len(scenario_str)
+        value = scenario_str[value_start:value_end].strip().rstrip(",").strip()
+        scenario[key] = value
+    return scenario
+
+
+def _build_scenario_text(scenarios_slice, start_idx):
+    text = ""
+    for idx, s in enumerate(scenarios_slice, start=start_idx):
+        text += (
+            "\nScenario " + str(idx) + ":\n"
+            "  Scenario ID: " + str(s.get("Scenario ID", "")) + "\n"
+            "  Scenario Name: " + str(s.get("Scenario Name", "")) + "\n"
+            "  Workday BP: " + str(s.get("Workday BP", "")) + "\n"
+            "  Workstream: " + str(s.get("Workstream", "")) + "\n"
+            "  Test Scenario Description: " + str(s.get("Test Scenario Description", "")) + "\n"
+            "  Expected Result: " + str(s.get("Expected Result", "")) + "\n"
+            "  Initiator: " + str(s.get("Initiator", "")) + "\n"
+        )
+    return text
+
+    
+
+def _parse_markdown_to_df(markdown_output):
+    lines = [line.strip() for line in markdown_output.splitlines() if line.strip()]
+    table_lines = [line for line in lines if line.startswith("|")]
+
+    if len(table_lines) < 2:
+        return None
+
+    cleaned_lines = [
+        line for line in table_lines
+        if not re.match(r'^\|\s*[-:]+[\s|:|-]*$', line)
+    ]
+
+    csv_text = "\n".join([line.strip("|") for line in cleaned_lines])
+
+    try:
+        df = pandas.read_csv(io.StringIO(csv_text), sep="|", engine="python")
+        df.columns = [col.strip() for col in df.columns]
+        df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+        return df
+    except Exception:
+        return None

@@ -143,60 +143,7 @@ Step 2: read XML_Details_<id>.txt → split per BP → Claude (parallel) builds
 ---
 
 ## Architecture Diagram
-
-```mermaid
-flowchart TD
-    User([User in Canvas Chat])
-
-    subgraph Agent[GTS Agent Tools]
-        T1[wdquasar_reposcenarios<br/>Library path]
-        T2[wd_bp_quasar_to_workday_xml<br/>BP-definition step 1]
-        T3[wd_bp_quasar_xml_to_csv_pll<br/>BP-definition step 2]
-        T4[workday_send_msg_to_canvas_wd<br/>Chat reply]
-    end
-
-    subgraph Platform[core SDK - Platform Services]
-        SEC[Secret Store<br/>core.get_secret]
-        ART[Artifact Storage<br/>get_artifact / write_artifact]
-        URL[Presigned URL<br/>generate_presigned_url]
-    end
-
-    Quasar[(Quasar<br/>Vector Search /<br/>Knowledge Base)]
-    Workday[(Workday<br/>Custom Report / RaaS)]
-    Claude[Claude<br/>Anthropic-compatible<br/>HTTP endpoint]
-    Canvas[Canvas Messaging API]
-
-    User --> T1
-    User --> T2
-    T2 --> T3
-
-    T1 --> SEC
-    T2 --> SEC
-    T3 --> SEC
-    T4 --> SEC
-
-    T1 --> Quasar
-    T2 --> Quasar
-    T2 --> Workday
-
-    T1 --> Claude
-    T2 --> Claude
-    T3 --> Claude
-
-    T2 --> ART
-    T3 --> ART
-    T1 --> ART
-    ART --> URL
-
-    T1 --> URL
-    T3 --> URL
-
-    URL --> T4
-    T4 --> Canvas
-    Canvas --> User
-```
-
----
+<img width="962" height="666" alt="image" src="https://github.com/user-attachments/assets/82a0d7ea-2014-46de-966a-4b1ed79af7d3" />
 
 ## Architecture Explanation
 

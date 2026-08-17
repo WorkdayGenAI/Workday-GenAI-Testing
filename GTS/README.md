@@ -1,5 +1,83 @@
 # GTS Agent (Generate Test Scenarios / Test Cases)
 
+---
+
+## Appendix (Quick Reference)
+
+> This appendix sits at the top on purpose — it is a one-screen "cheat sheet" so any reader
+> (technical or non-technical) can find what they need before diving into the full document.
+
+### A. Table of Contents
+- [What Is This Agent?](#what-is-this-agent)
+- [Quick Summary](#quick-summary)
+- [Business Value — Time Savings](#business-value--time-savings)
+- [Key Features](#key-features)
+- [How the Agent Works](#how-the-agent-works)
+- [Architecture Diagram](#architecture-diagram)
+- [Architecture Explanation](#architecture-explanation)
+- [Project Structure](#project-structure)
+- [Technology Stack](#technology-stack)
+- [Prerequisites](#prerequisites)
+- [Installation Guide](#installation-guide)
+- [Environment Variables](#environment-variables)
+- [Running the Agent](#running-the-agent)
+- [Usage Examples](#usage-examples)
+- [Dependencies](#dependencies)
+- [APIs and Integrations](#apis-and-integrations)
+- [Security and Authentication](#security-and-authentication)
+- [Monitoring and Logging](#monitoring-and-logging)
+- [Testing](#testing)
+- [Troubleshooting](#troubleshooting)
+- [Assumptions, Risks and Gaps](#assumptions-risks-and-gaps)
+- [Business Value](#business-value)
+- [Executive Summary](#executive-summary)
+
+### B. Glossary (plain-English)
+| Term | What it means |
+|------|---------------|
+| **Agent** | A bundle of automated tools that does a job for you when asked in chat |
+| **BP (Business Process)** | A Workday workflow such as *Hire*, *Change Job*, *Terminate Employee* |
+| **Test case** | A precise "do this, expect that" instruction used to verify software works |
+| **Scenario matrix** | The full set of situations to test (e.g. condition TRUE vs FALSE, approve vs send-back) |
+| **Quasar** | The knowledge base / search service that stores scenarios and process definitions |
+| **Workday** | The HR system being tested; here it is the source of the live process definition |
+| **RaaS** | *Report-as-a-Service* — a Workday feature that returns report data over the web |
+| **Claude** | The AI model that actually writes the test cases |
+| **Canvas** | The chat window where the user talks to the agent and gets results |
+| **CSV** | A spreadsheet file (opens in Excel) — the agent's main output |
+| **Artifact** | Any file the platform stores for you (uploaded input or generated output) |
+| **Presigned URL** | A temporary, private download link for a generated file |
+
+### C. Tools at a glance
+| Tool file | Path | Role | Key inputs | Output |
+|-----------|------|------|-----------|--------|
+| `wdquasar_reposcenarios` | Library path | Scenario library → test cases | `payload`, `BusinessProcessName`, `conversationid`, `fileinitialname` | Test-cases **CSV** + URL |
+| `wd_bp_quasar_to_workday_xml` | BP-definition step 1 | Workday definition XML → extracted steps | `bp_input_json`, `filename`, `conversationid` | Steps **.txt** + URL |
+| `wd_bp_quasar_xml_to_csv_pll` | BP-definition step 2 | Extracted steps → scenario-matrix test cases | `conversationid` | Test-cases **CSV** + URL |
+| `workday_send_msg_to_canvas_wd` | Delivery | Post result into chat | `conversation_id`, `message`, `environment`, `recipient_id` | Confirmation |
+
+### D. Key facts & constants (from the code)
+| Item | Value |
+|------|-------|
+| Language | Python 3 |
+| Core libraries | `requests`, `pandas`, `concurrent.futures` |
+| Claude secret | `SCA_WA_Claude_Opus_4_6` |
+| Quasar secret | `wd-tool-secrets` |
+| Workday secret | `wd_dnt_10` |
+| Chunk size / workers | `CHUNK_SIZE = 40`, `MAX_WORKERS = 8` |
+| Claude `max_tokens` | `16000` (reposcenarios) / `8000` (XML extract & CSV step) |
+| Quasar index | `wd_TSEndtoEndTesting_idx` |
+| Scenario library | `HCM_Test_Scenario_Library_Consolidated.xlsx` |
+| BP definition source | `BP_Definition_HCM.xlsx` |
+| Step-2 input file | `artifacts/XML_Details_<conversationid>.txt` |
+
+### E. Reference key
+- ✅ **Fact** — taken directly from the source code.
+- ⚠️ **Assumption** — inferred and clearly labelled as such in the body.
+- ❓ **Unable to determine from repository analysis** — not present in the repo; never guessed.
+
+---
+
 ## What Is This Agent?
 
 The **GTS agent** is a smart helper that automatically writes **software test cases for

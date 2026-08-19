@@ -1,4 +1,4 @@
-# GTS — The Workday Test-Case Writing Robot
+# GTS — The Workday Test-Case
 
 > **Who is this for?** Everyone. A manager deciding if it's worth the money, a brand-new
 > joiner who has never touched the code, or a curious 10-year-old. Every technical word is

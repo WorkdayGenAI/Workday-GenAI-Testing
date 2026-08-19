@@ -1,16 +1,5 @@
 # GTS — The Workday Generate Test Scenario
 
-> **Who is this for?** Everyone. A manager deciding if it's worth the money, a brand-new
-> joiner who has never touched the code, or a curious 10-year-old. Every technical word is
-> explained in plain brackets the first time it appears. If you get lost, jump to the
-> **Word List** at the very bottom.
-
-This one folder ("GTS Repos") holds **five closely-related helpers** that all do the same
-basic job in slightly different ways. This README treats them as **one family** and explains
-the whole thing together.
-
----
-
 ## Contents (click to jump)
 
 1. [What Does This Do?](#section-1--what-does-this-do)

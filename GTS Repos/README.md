@@ -214,117 +214,188 @@ This folder has **one tool**:
 
 > **Why read this?** One simple map so you can see how all the pieces fit together.
 
-### How the system works — Overview
+### System Overview — How All the Pieces Connect
 
 ```mermaid
 flowchart LR
-    subgraph YOU["🧑 You"]
-        A["Type a request\nin the company chat"]
-    end
+    A(("🧑 YOU\n\nType a request\nin company chat")):::user
 
-    subgraph PLATFORM["🤖 Accenture AI Platform"]
+    A -- "e.g. Generate test cases\nfor Hire Employee" --> B
+
+    subgraph PLATFORM [" 🤖  ACCENTURE AI PLATFORM "]
         direction TB
-        B["Platform picks\nthe right tool"]
+        B["Route Request\nto the right tool"]:::platform
     end
 
-    subgraph SOURCES["📚 Data Sources"]
+    subgraph SOURCES [" 📚  WHERE THE DATA COMES FROM "]
         direction TB
-        C["🗄️ Quasar\nSearchable filing cabinet"]
-        D["🏢 Workday\nLive HR/Finance rulebook"]
-        E["📄 Your Upload\nSpreadsheet or User Story"]
+        C["🗄️ QUASAR\n━━━━━━━━━━━━━━━━━━━\nSearchable filing cabinet\nthat finds scenarios\nby meaning"]:::quasar
+        D["🏢 WORKDAY\n━━━━━━━━━━━━━━━━━━━\nLive HR / Finance system\nwith official process\ndefinitions"]:::workday
+        E["📄 YOUR INPUT\n━━━━━━━━━━━━━━━━━━━\nUploaded spreadsheet\nor pasted user story"]:::upload
     end
 
-    subgraph AI["🧠 AI Engines"]
+    subgraph BRAINS [" 🧠  AI ENGINES THAT WRITE THE TEST CASES "]
         direction TB
-        F["Claude API\n(Helpers 1–4)"]
-        F2["Claude Code + Bedrock\n(Helper 5 only)"]
+        F["CLAUDE API\n━━━━━━━━━━━━━━━━━━━\nUsed by Helpers 1 – 4\nCalled over the web\nvia Accenture platform"]:::claude
+        F2["CLAUDE CODE + BEDROCK\n━━━━━━━━━━━━━━━━━━━\nUsed by Helper 5 only\nRuns as a program on\nthe server via Amazon"]:::bedrock
     end
 
-    subgraph OUTPUT["📊 Output"]
-        G["CSV spreadsheet\n+ download link"]
+    subgraph FINISH [" 📊  WHAT YOU GET BACK "]
+        G["CSV SPREADSHEET\n━━━━━━━━━━━━━━━━━━━\nReady-to-use test cases\nin Excel-friendly format\n+ temporary download link"]:::output
     end
 
-    A --> B
-    B --> C
-    B --> E
-    C -->|"reference ID"| D
-    C --> F
-    D --> F
-    E --> F
-    E --> F2
-    F --> G
-    F2 --> G
-    G -->|"send_msg_to_canvas\ntool sends link"| A
+    B -- "process name\ne.g. Hire Employee" --> C
+    B -- "uploaded file or\nuser story text" --> E
+    C -- "look up\nreference ID" --> D
+    C -- "pre-written\nscenarios" --> F
+    D -- "official process\ndefinition" --> F
+    E -- "step data or\nstory text" --> F
+    E -- "step data\n(Helper 5)" --> F2
+    F -- "finished\ntest cases" --> G
+    F2 -- "finished\ntest cases" --> G
+    G -- "💬 send_msg_to_canvas\n  sends download link\n  back to your chat" --> A
+
+    classDef user fill:#4A90D9,stroke:#2C5F8A,color:#fff,font-weight:bold
+    classDef platform fill:#6C5CE7,stroke:#4A3CB5,color:#fff
+    classDef quasar fill:#00B894,stroke:#00876A,color:#fff
+    classDef workday fill:#0984E3,stroke:#0667B2,color:#fff
+    classDef upload fill:#FDCB6E,stroke:#D4A84B,color:#2D3436
+    classDef claude fill:#E17055,stroke:#B85742,color:#fff
+    classDef bedrock fill:#D63031,stroke:#A82526,color:#fff
+    classDef output fill:#00CEC9,stroke:#00A8A4,color:#2D3436
+```
+
+> **Reading the diagram:** Follow the arrows from left to right. You type a request → the
+> platform routes it → data is gathered from the right source → the AI writes the test
+> cases → a spreadsheet is produced → the download link lands back in your chat.
+
+---
+
+### Detailed Path Map — Every Helper Step-by-Step, with Examples
+
+Each box below shows the exact pipeline for one helper. Follow the arrows from left to right
+to see what happens at each stage. **Real-world examples** are included so you can see exactly
+what you'd type and what comes back.
+
+```mermaid
+flowchart TB
+    subgraph START [" 🧑  WHAT YOU TYPE IN THE CHAT "]
+        U["Your request in the\ncompany chat window"]:::user
+    end
+
+    subgraph PATH_A [" HELPER 1 — HR Library Path "]
+        direction LR
+        A1["🗄️ Search Quasar\n\nLooks up HR scenarios in\nHCM_Test_Scenario_Library\n_Consolidated.xlsx"]:::quasar
+        A2["🧠 Claude API\n\n8 parallel workers\nprocess 40 scenarios\nper batch"]:::claude
+        A3["📊 CSV Output\n\ne.g. HireEmployee_\n20260819_101500.csv"]:::output
+
+        A1 -- "matched\nscenarios" --> A2 -- "test cases\ngenerated" --> A3
+    end
+
+    subgraph PATH_B [" HELPER 1 — Workday Rulebook Path  (two stages) "]
+        direction LR
+        B1["🗄️ Search Quasar\n\nFinds the Reference ID\nfor the BP name in\nBP_Definition_HCM.xlsx"]:::quasar
+        B2["🏢 Call Workday\n\nDownloads the official\nXML process definition\nusing that Reference ID"]:::workday
+        B3["🧠 Claude - Stage 1\n\nReads the raw XML\nand extracts all steps\ninto a clean text file"]:::claude
+        B4["🧠 Claude - Stage 2\n\nReads the text file,\ngenerates test cases\nin parallel"]:::claude
+        B5["📊 CSV Output\n\ne.g. TestCaseGenerated_\nabc123.csv"]:::output
+
+        B1 -- "reference\nID found" --> B2 -- "XML\ndownloaded" --> B3 -- ".txt file\nsaved" --> B4 -- "test cases\ngenerated" --> B5
+    end
+
+    subgraph PATH_C [" HELPER 2 — Finance Library Path "]
+        direction LR
+        C1["🗄️ Search Quasar\n\nLooks up Finance scenarios\nin Vectorization_Repository\n___30th_Oct_2025.xlsx"]:::quasar
+        C2["🧠 Claude API\n\n8 parallel workers\nsame as Helper 1"]:::claude
+        C3["📊 CSV Output"]:::output
+
+        C1 -- "matched\nscenarios" --> C2 -- "test cases\ngenerated" --> C3
+    end
+
+    subgraph PATH_D [" HELPER 3 — User Story Path "]
+        direction LR
+        D1["📄 Your User Story\n\nPasted as plain text\ndirectly into the chat"]:::upload
+        D2["🧠 Claude API\n\nSingle call, invents\nbrand-new test cases\nfrom scratch"]:::claude
+        D3["📊 CSV Output\n\nScenarios start with\nUS0001, US0002, etc."]:::output
+
+        D1 -- "story\ntext" --> D2 -- "test cases\ninvented" --> D3
+    end
+
+    subgraph PATH_E [" HELPER 4 — Upload Spreadsheet "]
+        direction LR
+        E1["📄 Your XLSX File\n\nProcess steps exported\nfrom Workday, uploaded\nto the chat"]:::upload
+        E2["🧠 Claude API\n\nReads the step data\nwith auto-continue\nif response is long"]:::claude
+        E3["📊 CSV Output\n\ne.g. TestCaseGenerated_\ndef456.csv"]:::output
+
+        E1 -- "step data\nextracted" --> E2 -- "test cases\ngenerated" --> E3
+    end
+
+    subgraph PATH_F [" HELPER 5 — Heavy-Duty Upload  (Linux only) "]
+        direction LR
+        F1["📄 Your XLSX File\n\nSame kind of export\nas Helper 4"]:::upload
+        F2["🧠 Claude Code CLI\n\nRuns on the server as\na program via Amazon\nBedrock — heavier engine"]:::bedrock
+        F3["📊 CSV Output"]:::output
+
+        F1 -- "step data\nextracted" --> F2 -- "test cases\ngenerated" --> F3
+    end
+
+    subgraph DELIVER [" 💬  DELIVERY "]
+        CANVAS["send_msg_to_canvas\n\nSends the download link\nback to your chat window"]:::deliver
+    end
+
+    U -- "'Generate test cases\nfor Hire Employee'" --> PATH_A
+    U -- "'Generate test cases\nfor Hire Employee'\n(no library scenarios exist)" --> PATH_B
+    U -- "'Generate test cases\nfor Journal Entry'" --> PATH_C
+    U -- "'As an HR Partner, I want\nto transfer an employee\nso the org chart updates'" --> PATH_D
+    U -- "Uploads:\nHire_Steps.xlsx" --> PATH_E
+    U -- "Uploads:\nHire_Steps.xlsx\n(heavy-duty mode)" --> PATH_F
+
+    A3 --> CANVAS
+    B5 --> CANVAS
+    C3 --> CANVAS
+    D3 --> CANVAS
+    E3 --> CANVAS
+    F3 --> CANVAS
+
+    CANVAS -- "download link\nappears in chat" --> U
+
+    classDef user fill:#4A90D9,stroke:#2C5F8A,color:#fff,font-weight:bold
+    classDef quasar fill:#00B894,stroke:#00876A,color:#fff
+    classDef workday fill:#0984E3,stroke:#0667B2,color:#fff
+    classDef upload fill:#FDCB6E,stroke:#D4A84B,color:#2D3436
+    classDef claude fill:#E17055,stroke:#B85742,color:#fff
+    classDef bedrock fill:#D63031,stroke:#A82526,color:#fff
+    classDef output fill:#00CEC9,stroke:#00A8A4,color:#2D3436
+    classDef deliver fill:#A29BFE,stroke:#7C73D6,color:#fff
 ```
 
 ---
 
-### Detailed path map — Which helper uses what
+### Example Walkthrough — The Most Common Flow
+
+> **Scenario:** You want test cases for the *"Hire Employee"* business process and the HR
+> scenario library is already loaded.
 
 ```mermaid
-flowchart TB
-    subgraph INPUT["🧑 User Request"]
-        U["User types in\nCompany Chat"]
-    end
+flowchart LR
+    S1["🧑 You type:\n'Generate test cases\nfor Hire Employee'"]:::user
+    S2["🤖 Platform routes\nto Helper 1\n(HR Library path)"]:::platform
+    S3["🗄️ Quasar searches\nHCM library and finds\n47 matching scenarios"]:::quasar
+    S4["🧠 Claude receives\n47 scenarios in 2 batches\n(40 + 7), processed\nby 8 parallel workers"]:::claude
+    S5["📊 CSV created:\nHireEmployee_20260819\n_101500_abc123.csv\nwith 47 test case rows"]:::output
+    S6["💬 Download link\nappears in your chat —\nclick to open in Excel"]:::deliver
 
-    subgraph H1["Helper 1 — HR Library"]
-        direction LR
-        H1A["Search Quasar\n(HR scenarios)"] --> H1B["Claude API\n(parallel chunks)"]
-        H1B --> H1C["CSV file"]
-    end
+    S1 --> S2 --> S3 --> S4 --> S5 --> S6
 
-    subgraph H1W["Helper 1 — Workday Rulebook Path"]
-        direction LR
-        H1WA["Search Quasar\n(find Reference ID)"] --> H1WB["Call Workday API\n(download XML)"]
-        H1WB --> H1WC["Claude API\n(extract steps → .txt)"]
-        H1WC --> H1WD["Claude API\n(generate test cases\nin parallel)"]
-        H1WD --> H1WE["CSV file"]
-    end
-
-    subgraph H2["Helper 2 — Finance Library"]
-        direction LR
-        H2A["Search Quasar\n(Finance scenarios)"] --> H2B["Claude API\n(parallel chunks)"]
-        H2B --> H2C["CSV file"]
-    end
-
-    subgraph H3["Helper 3 — User Story"]
-        direction LR
-        H3A["Paste User Story"] --> H3B["Claude API\n(single call)"]
-        H3B --> H3C["CSV file"]
-    end
-
-    subgraph H4["Helper 4 — Upload Spreadsheet"]
-        direction LR
-        H4A["Upload XLSX"] --> H4B["Claude API\n(with auto-continue)"]
-        H4B --> H4C["CSV file"]
-    end
-
-    subgraph H5["Helper 5 — Heavy-Duty Upload"]
-        direction LR
-        H5A["Upload XLSX"] --> H5B["Claude Code CLI\n(via Bedrock)"]
-        H5B --> H5C["CSV file"]
-    end
-
-    subgraph REPLY["💬 Reply"]
-        CANVAS["send_msg_to_canvas\nsends download link\nback to chat"]
-    end
-
-    U --> H1
-    U --> H1W
-    U --> H2
-    U --> H3
-    U --> H4
-    U --> H5
-
-    H1C --> CANVAS
-    H1WE --> CANVAS
-    H2C --> CANVAS
-    H3C --> CANVAS
-    H4C --> CANVAS
-    H5C --> CANVAS
-
-    CANVAS --> U
+    classDef user fill:#4A90D9,stroke:#2C5F8A,color:#fff,font-weight:bold
+    classDef platform fill:#6C5CE7,stroke:#4A3CB5,color:#fff
+    classDef quasar fill:#00B894,stroke:#00876A,color:#fff
+    classDef claude fill:#E17055,stroke:#B85742,color:#fff
+    classDef output fill:#00CEC9,stroke:#00A8A4,color:#2D3436
+    classDef deliver fill:#A29BFE,stroke:#7C73D6,color:#fff
 ```
+
+> **Total time:** About 2–5 minutes from typing to download link.
 
 ---
 

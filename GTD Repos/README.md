@@ -1,4 +1,4 @@
-# GTD (Generate Test Data) Repositories
+# GTD- Workday Generate Test Data
 
 Welcome to the **GTD Repos** — a collection of GenAI agents that automatically generate **EIB (Enterprise Interface Builder) load templates** filled with test data for Workday HCM implementations.
 
@@ -90,6 +90,213 @@ If Claude hits the token limit and returns `stop_reason == "max_tokens"`:
 - The tool sends: *"Continue from exactly where you stopped, do not repeat the table header"*
 - Claude resumes and appends the next batch of rows
 - This repeats until the full table is generated
+
+---
+
+## Architecture & Workflow Diagrams
+
+### 1. GTD Agent Workflow Diagram
+
+```mermaid
+graph TB
+    subgraph User["User Interface"]
+        A["Canvas Chat UI"]
+    end
+
+    subgraph Input["User Input"]
+        B["Business Context"]
+        C["Optional: EIB Excel Template"]
+    end
+
+    subgraph Agent["GTD Agent Brain - Claude LLM"]
+        D["Claude Opus 4.6"]
+        E["Tool Decision Logic"]
+    end
+
+    subgraph ToolCalls["Available Tools"]
+        F["wdsearchvector"]
+        G["WD_TDM_report_*"]
+        H["wd_gtd_eib_template<br/>wd_gtd_eib_template1"]
+    end
+
+    subgraph DataSources["External Data Sources"]
+        I["Quasar Vector DB"]
+        J["Workday RaaS<br/>Custom Reports"]
+    end
+
+    subgraph Processing["Data Processing Pipeline"]
+        K["Parse Reference Data"]
+        L["Generate Markdown<br/>Test Data Table"]
+        M["Handle max_tokens<br/>Continuation Loop"]
+    end
+
+    subgraph FileHandling["File Generation"]
+        N["Populate Excel Workbook"]
+        O["Match Columns"]
+        P["Write Data from Row 6"]
+    end
+
+    subgraph Output["Output & Delivery"]
+        Q["Generate Presigned URL"]
+        R["Post to Canvas Chat"]
+        S["User Downloads File"]
+    end
+
+    A -->|Input| B
+    A -->|Upload| C
+    B --> E
+    C --> H
+    E -->|Decides which tools| F
+    E -->|Decides which tools| G
+    E -->|Decides which tools| H
+    
+    F -->|Search Quasar| I
+    G -->|Fetch from Workday| J
+    
+    I -->|Return Scenarios/Examples| K
+    J -->|Return Live Data| K
+    K --> L
+    L -->|If max_tokens hit| M
+    M -->|Continue generation| L
+    L -->|Markdown Table| H
+    
+    C -->|Excel File| H
+    L -->|Test Data| H
+    H --> N
+    N --> O
+    O --> P
+    P --> Q
+    Q --> R
+    R --> S
+
+    style User fill:#e1f5ff
+    style Agent fill:#fff3e0
+    style ToolCalls fill:#f3e5f5
+    style DataSources fill:#e8f5e9
+    style Processing fill:#fce4ec
+    style FileHandling fill:#f1f8e9
+    style Output fill:#ede7f6
+```
+
+### 2. System Architecture Diagram
+
+```mermaid
+graph TB
+    subgraph Platform["Accenture GenWizard Platform (ATR)"]
+        Canvas["Canvas Chat UI"]
+        SecretStore["Secret Store<br/>Credentials"]
+        ArtifactStore["Artifact Store<br/>File Storage"]
+    end
+
+    subgraph GTDAgent["GTD Agent Container"]
+        subgraph Tools["Tool Functions"]
+            T1["wdsearchvector"]
+            T2["WD_TDM_report_<br/>Genwizard_*"]
+            T3["wd_gtd_eib_<br/>template"]
+            T4["workday_gtd_<br/>send_msg_to_canvas"]
+        end
+        
+        CoreSDK["Core Module SDK<br/>get_secret, get_artifact,<br/>write_artifact, etc."]
+    end
+
+    subgraph ExternalSystems["External Systems"]
+        Quasar["Quasar API<br/>Vector Search"]
+        Workday["Workday RaaS<br/>Custom Reports"]
+        Claude["Claude LLM<br/>Anthropic Endpoint"]
+    end
+
+    Canvas -->|User chats| GTDAgent
+    GTDAgent -->|Authenticate| SecretStore
+    GTDAgent -->|Read/Write files| ArtifactStore
+    
+    CoreSDK -->|Uses| T1
+    CoreSDK -->|Uses| T2
+    CoreSDK -->|Uses| T3
+    CoreSDK -->|Uses| T4
+    
+    T1 -->|Search| Quasar
+    T2 -->|Fetch via HTTP Auth| Workday
+    T3 -->|Loads Excel| ArtifactStore
+    T4 -->|Posts result| Canvas
+    
+    GTDAgent -->|Calls LLM API| Claude
+    Claude -->|Returns text| GTDAgent
+    
+    style Platform fill:#e3f2fd
+    style GTDAgent fill:#fff9c4
+    style ExternalSystems fill:#ffebee
+```
+
+### 3. Sequence Diagram: GTD-Candidate Data Example
+
+```mermaid
+sequenceDiagram
+    participant User as User<br/>Canvas
+    participant Agent as GTD-Candidate<br/>Data Agent
+    participant Quasar as Quasar<br/>Vector DB
+    participant LLM as Claude<br/>LLM
+    participant EIB as wd_gtd_eib_<br/>template
+    participant Canvas as Canvas<br/>Messenger
+
+    User->>Agent: "Generate 200 candidate test data"
+    Agent->>Agent: Decide tools needed
+    
+    Agent->>Quasar: wdsearchvector<br/>"candidate test scenarios"
+    Quasar-->>Agent: Return example candidates (JSON)
+    
+    Agent->>LLM: Prompt: generate candidate table<br/>(with Quasar context)
+    LLM-->>Agent: Markdown table (100 rows)
+    
+    Note over LLM,Agent: Check if max_tokens hit
+    Agent->>LLM: "Continue from row 101..."
+    LLM-->>Agent: Markdown table (rows 101-200)
+    
+    Agent->>EIB: Load uploaded EIB file +<br/>generated data
+    EIB->>EIB: Parse Markdown table
+    EIB->>EIB: Match columns by name
+    EIB->>EIB: Write rows 6-205
+    EIB-->>Agent: Download link
+    
+    Agent->>Canvas: workday_gtd_send_msg_to_canvas<br/>Post download link + summary
+    Canvas-->>User: "Here's your file!<br/>[Download]"
+    
+    User->>User: Download Excel file
+```
+
+### Key Architecture Concepts
+
+#### **1. Layered Tool Architecture**
+```
+User Chat
+    ↓
+Agent LLM (decides WHICH tools to call)
+    ↓
+Tool Layer (platform SDK + specific functions)
+    ↓
+External APIs (Quasar, Workday, Claude)
+```
+
+#### **2. Data Flow Pattern**
+```
+Reference Data (Quasar/Workday)
+    ↓ (enriches)
+LLM Prompt + Context
+    ↓ (generates)
+Markdown Table
+    ↓ (transforms)
+Excel Workbook
+    ↓ (delivers)
+Download Link in Chat
+```
+
+#### **3. Token Management Pattern**
+```
+LLM generates table:
+  ├─ Returns 100 rows (stop_reason: max_tokens)
+  ├─ Agent sends: "Continue from where you stopped"
+  ├─ LLM generates rows 101-200
+  └─ Repeat until complete
+```
 
 ---
 

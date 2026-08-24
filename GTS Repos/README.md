@@ -41,10 +41,10 @@ analysts on Workday projects — mostly at Accenture.
 
 > **Why read this?** So you understand what's happening "behind the curtain" when you press go — no surprises.
 
-Here is the journey, told as a story. There are a few different doors into the same house, so
+Here is the journey, told as a story. There are a few different methods into the same house, so
 we'll walk through each one.
 
-### 🔍 Door 1 — "Look it up in the library"
+### 🔍 Method 1 — "Look it up in the library"
 
 When a tester types *"Generate test cases for Hire Employee"* into the company chat window, the
 tool searches a big **searchable filing cabinet** (an internal Accenture search system called
@@ -55,7 +55,7 @@ actually writes the words). To go faster on big jobs, it splits the work into sm
 sends **several piles to Claude at once** — like having eight assistants each write a different
 chapter of a book at the same time instead of one person writing all of it.
 
-### 📖 Door 2 — "Read the official Workday rulebook"
+### 📖 Method 2 — "Read the official Workday rulebook"
 
 If no pre-written notes exist, the tool can go and read the **live rulebook straight from
 Workday itself** — the official, step-by-step definition of how a process like "Hire Employee"
@@ -76,14 +76,14 @@ actually runs. This path is a **two-stage journey**:
 > work into "understand the rules" and then "write the tests" gives Claude the best chance of
 > being thorough and accurate.
 
-### ✍️ Door 3 — "Write from a user story"
+### ✍️ Method 3 — "Write from a user story"
 
 If you have a **user story** (a short plain-English description of what someone needs, written
 like *"As an HR Partner, I want to transfer an employee so the org chart updates"*), you can
 paste that directly in. The AI **invents brand-new test cases from scratch** — no filing
 cabinet or Workday connection needed.
 
-### 📄 Door 4 — "Upload a spreadsheet"
+### 📄 Method 4 — "Upload a spreadsheet"
 
 You can also **upload a spreadsheet** that lists the steps of a process (exported from
 Workday). The tool reads the file, hands the step data to Claude, and gets back the finished
@@ -399,7 +399,7 @@ flowchart LR
 
 ---
 
-### Quick-reference: "Which door do I use?"
+### Quick-reference: "Which Method do I use?"
 
 | I have… | Use this helper | Folder |
 |---------|----------------|--------|

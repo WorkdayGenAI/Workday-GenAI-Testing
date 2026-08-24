@@ -41,7 +41,7 @@ analysts on Workday projects — mostly at Accenture.
 
 > **Why read this?** So you understand what's happening "behind the curtain" when you press go — no surprises.
 
-Here is the journey, told as a story. There are a few different methods into the same house, so
+Here is the journey, told as a story. There are a few different methods into the same use case, so
 we'll walk through each one.
 
 ### 🔍 Method 1 — "Look it up in the library"

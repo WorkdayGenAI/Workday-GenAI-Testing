@@ -217,7 +217,7 @@ This folder has **one tool**:
 ### System Overview — How All the Pieces Connect
 
 <p align="center">
-  <img src="docs/Workday Test Case Generation Agent - E2E workflow (1).png" width="700"/>
+  <img src="docs/GTS Agent Workflow - From User Request to Test Case (1).png" width="700"/>
 </p>
 
 ### Detailed Path Map — Every Helper Step-by-Step, with Examples
@@ -227,7 +227,7 @@ to see what happens at each stage. **Real-world examples** are included so you c
 what you'd type and what comes back.
 
 <p align="center">
-  <img src="docs/GTS Agent Workflow - From User Request to Test Case (1).png" width="700"/>
+  <img src="docs/Workday Test Case Generation Agent - E2E workflow (1).png" width="700"/>
 </p>
 
 ### Example Walkthrough — The Most Common Flow
